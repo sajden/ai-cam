@@ -1,0 +1,73 @@
+mqtt:
+  host: mosquitto
+  port: 1883
+  topic_prefix: frigate
+
+database:
+  path: /data/frigate.db
+
+logger:
+  default: info
+
+# CPU detector for MVP. Replace later with Coral/NPU if you add hardware.
+detectors:
+  cpu1:
+    type: cpu
+
+objects:
+  track:
+    - person
+    - dog
+    - cat
+
+# Event-based recording only:
+# - Continuous recordings are retained 0 days
+# - Event clips are retained for FRIGATE_EVENT_RETAIN_DAYS
+record:
+  enabled: true
+  retain:
+    days: 0
+    mode: motion
+  events:
+    pre_capture: 5
+    post_capture: 5
+    retain:
+      default: ${FRIGATE_EVENT_RETAIN_DAYS}
+      mode: motion
+
+snapshots:
+  enabled: true
+  timestamp: true
+  bounding_box: true
+  retain:
+    default: ${FRIGATE_SNAPSHOT_RETAIN_DAYS}
+
+# Reolink E1 Pro (common RTSP paths):
+# - main: /h264Preview_01_main
+# - sub:  /h264Preview_01_sub
+#
+# Tip: use sub-stream for detection (lower CPU) and main stream for recording.
+cameras:
+  reolink_e1pro:
+    ffmpeg:
+      inputs:
+        - path: rtsp://${CAMERA_USER}:${CAMERA_PASS}@${CAMERA_HOST}:554${RTSP_MAIN_PATH}
+          roles:
+            - record
+        - path: rtsp://${CAMERA_USER}:${CAMERA_PASS}@${CAMERA_HOST}:554${RTSP_SUB_PATH}
+          roles:
+            - detect
+    detect:
+      enabled: true
+      width: ${DETECT_WIDTH}
+      height: ${DETECT_HEIGHT}
+      fps: ${DETECT_FPS}
+
+    # Optional: mask and zones (fill in later)
+    motion:
+      mask: []
+    zones: {}
+
+birdseye:
+  enabled: true
+  mode: motion

@@ -1,0 +1,101 @@
+```mermaid
+flowchart TD
+  %% ==========
+  %% SOURCES
+  %% ==========
+  CAM[Reolink E1 Pro<br/>RTSP Video+Audio In] -->|RTSP| FRIG[Frigate NVR<br/>Local ingest + events + clips]
+  CAM -->|RTSP audio (optional 24/7)| AUD[Audio Stream Bridge<br/>ffmpeg/rtsp->pcm]
+
+  PHONE[Phone (Tailscale)] -->|VPN| HAUI[Home Assistant UI<br/>8123 (Tailscale-only)]
+  PCUI[PC Browser UI<br/>127.0.0.1:8123] --> HAUI
+
+  %% ==========
+  %% CORE BUS
+  %% ==========
+  FRIG -->|Events| MQTT[MQTT (Mosquitto)<br/>Local event bus]
+  FRIG -->|Clips/Snapshots| DATA[(./data/...<br/>clips/recordings/logs/models)]
+
+  %% ==========
+  %% HOME ASSISTANT
+  %% ==========
+  HA[Home Assistant Core<br/>Automations + Assist pipelines] --- HAUI
+  MQTT --> HA
+  FRIG -->|Integration (optional)| HA
+
+  %% ==========
+  %% ALWAYS-ON POLICY SWITCHES
+  %% ==========
+  HA --> MODE[Helpers<br/>input_boolean.task_session_mode<br/>input_boolean.privacy_mode]
+  MODE -->|gate| POLICY[Policy Router<br/>Local rules: what may run/leave box]
+
+  %% ==========
+  %% VOICE INPUT (WAKE + STT)
+  %% ==========
+  AUD --> WAKE[OpenWakeWord (local)<br/>Wake phrase: "Hey ..."]
+  WAKE -->|trigger| REC[Record N seconds audio]
+  REC --> STT[Whisper STT (Wyoming)<br/>Audio -> Text]
+
+  %% If using push-to-talk in UI instead of RTSP audio:
+  HAUI -. Push-to-talk mic .-> STT
+
+  %% ==========
+  %% "BRAIN" (TEXT) + MEMORY
+  %% ==========
+  STT -->|user text| HUB[AI Orchestrator / "Brain"<br/>Intent + tools + routing]
+  HUB --> MEM[(SQLite Memory<br/>Conversations + facts)]
+  MEM --> HUB
+
+  %% ==========
+  %% TOOLING / ACTIONS
+  %% ==========
+  HUB -->|Smart-home intent| HA
+  HA -->|services/actions| DEV[Devices/Services<br/>lights, music, notifications]
+  HA -->|notify| PHONE
+
+  %% ==========
+  %% CAMERA ANALYSIS (LOCAL ONLY)
+  %% ==========
+  MQTT -->|event: person/dog/motion| HUB
+  HUB -->|if POLICY allows (event or task_session_mode)| SNAP[Fetch snapshot/clip<br/>from Frigate local]
+  SNAP --> VLM[Local Vision Model<br/>pose/rep count/activity]
+  VLM -->|text summary| HUB
+
+  %% ==========
+  %% OPTIONAL CLOUD ESCALATION (TEXT ONLY)
+  %% ==========
+  HUB -->|ONLY if user says "Hey Codex"<br/>and POLICY allows| CODEX[(Codex / Cloud LLM)]
+  CODEX -->|text response| HUB
+
+  %% ==========
+  %% VOICE OUTPUT (TTS)
+  %% ==========
+  HUB -->|response text| TTS[Chatterbox TTS (local)<br/>Text -> Speech]
+  TTS --> SPK[Speaker Output<br/>Bluetooth speaker (preferred)]
+  TTS -. optional talkback .-> CAMSPK[Camera Speaker<br/>Reolink talkback/ONVIF backchannel]
+
+  %% ==========
+  %% PRIVACY BOUNDARIES
+  %% ==========
+  subgraph LOCAL[Local-only boundary (no raw audio/video leaves PC)]
+    CAM
+    FRIG
+    MQTT
+    HA
+    MODE
+    POLICY
+    AUD
+    WAKE
+    STT
+    HUB
+    MEM
+    SNAP
+    VLM
+    TTS
+    SPK
+    DATA
+  end
+
+  subgraph CLOUD[Cloud boundary (text-only, explicit user trigger)]
+    CODEX
+  end
+```

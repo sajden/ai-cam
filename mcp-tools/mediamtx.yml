@@ -1,0 +1,9 @@
+logLevel: info
+
+paths:
+  reolink_main:
+    source: rtsp://CAMERA_USER:CAMERA_PASS@CAMERA_HOST:554/h264Preview_01_main
+    sourceOnDemand: yes
+  reolink_sub:
+    source: rtsp://CAMERA_USER:CAMERA_PASS@CAMERA_HOST:554/h264Preview_01_sub
+    sourceOnDemand: yes

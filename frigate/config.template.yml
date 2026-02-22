@@ -1,0 +1,89 @@
+mqtt:
+  # Frigate publishes events and listens to control topics (privacy mode, recording toggle).
+  # We point it at the internal Mosquitto service name on the Docker network.
+  # MQTT = local message bus (pub/sub). Mosquitto is the broker/server.
+  host: mosquitto
+  port: 1883
+  topic_prefix: frigate
+
+database:
+  # Stored inside ./data/frigate (mounted to /data in the container).
+  # This keeps Frigate state across restarts.
+  path: /data/frigate.db
+
+logger:
+  # Log level for Frigate internals.
+  default: info
+
+{{GO2RTC_BLOCK}}
+
+# CPU detector for MVP. Swap later for Coral/NPU/GPU if you add hardware.
+detectors:
+  # "detector" = the AI engine that detects objects in frames.
+  # CPU works but uses more CPU; Coral/GPU can be faster later.
+  cpu1:
+    type: cpu
+
+objects:
+  # What Frigate should try to detect/track.
+  # Start simple (person/dog/cat). Add more later if you need it.
+  track:
+    - person
+    - dog
+    - cat
+
+# Recording strategy (MVP):
+# - Keep *no* long-term continuous recording: `retain.days: 0`.
+# - Keep segments overlapping "alerts" and "detections" for FRIGATE_EVENT_RETAIN_DAYS.
+#   This acts as event-based recording.
+#
+# Event-based recording only (Frigate no longer uses `record: events:`; it uses `alerts` and `detections`).
+# - Continuous recordings are retained 0 days
+# - Recording segments overlapping with alerts/detections are retained for FRIGATE_EVENT_RETAIN_DAYS
+# - Snapshots retained per values below
+record:
+  # Global recording toggle.
+  enabled: true
+  retain:
+    # Continuous retention (0 = don't keep 24/7 history).
+    days: 0
+    mode: motion
+  alerts:
+    # "alerts" = high-signal events (typically what you care about most).
+    retain:
+      days: {{FRIGATE_EVENT_RETAIN_DAYS}}
+      mode: motion
+  detections:
+    # "detections" = object detection events (often more frequent than alerts).
+    retain:
+      days: {{FRIGATE_EVENT_RETAIN_DAYS}}
+      mode: motion
+
+snapshots:
+  # Snapshots = still images captured around events.
+  # Privacy-first default is disabled; enable only if you explicitly want still images.
+  enabled: {{FRIGATE_SNAPSHOTS_ENABLED}}
+  timestamp: true
+  bounding_box: true
+  retain:
+    default: {{FRIGATE_SNAPSHOT_RETAIN_DAYS}}
+
+# Camera ingest:
+# This template is committed to git WITHOUT secrets.
+# `scripts/render_frigate_config.sh` injects a `cameras:` block with RTSP URLs into the rendered file:
+# - output: ./data/config/frigate.yml (gitignored)
+# - mounted at: /config/config.yml
+#
+# Reolink E1 Pro (common RTSP paths):
+# - main: /h264Preview_01_main
+# - sub:  /h264Preview_01_sub
+#
+# Tip: use sub-stream for detection (lower CPU) and main stream for recording.
+#
+# Cameras section is injected by scripts/render_frigate_config.sh so credentials never live in git.
+{{CAMERAS_BLOCK}}
+
+birdseye:
+  # Birdseye = Frigate's overview view. With one camera it's still useful.
+  enabled: true
+  mode: motion

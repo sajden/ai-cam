@@ -1,0 +1,407 @@
+#
+# ai-cam docker-compose.yml
+#
+# High-level design goals:
+# - Local-first: all processing happens on your PC.
+# - Privacy-first: no port-forwarding, no public exposure.
+# - Persistent data lives in ./data/ (gitignored).
+# - Only UI ports are published to the host (and should be restricted to Tailscale).
+#
+# Networking model:
+# - Services talk to each other on a private Docker bridge network: ai-cam-net.
+# - We use `expose:` for internal-only ports (visible to other containers, not the host).
+# - We use `ports:` only for UIs you want to reach from your phone via Tailscale.
+#
+# Mini glossary (quick definitions):
+# - image: the packaged app we run (downloaded automatically by Docker).
+# - container: a running instance of an image.
+# - volume/bind mount: map a host folder (./data/...) into a container so data persists.
+# - ports: publish a container port to the host (this is what you must firewall).
+# - expose: make a port available only to other containers (not reachable from LAN/host).
+# - profile: optional group of services you enable explicitly (here: `rtsp-proxy`).
+#
+name: ai-cam
+
+services:
+  # Mosquitto = MQTT broker (message bus).
+  # MQTT is a lightweight local pub/sub system:
+  # - Frigate publishes "I detected a person" events
+  # - Home Assistant and scripts can subscribe and react
+  # - Scripts can also send control messages (privacy mode on/off)
+  #
+  # Security: not published to the host by default, so it is reachable only inside Docker.
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: ai-cam-mosquitto
+    restart: unless-stopped
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./data/mosquitto/data:/mosquitto/data
+      - ./data/mosquitto/log:/mosquitto/log
+    # If you later need MQTT from the host, enable this safely on localhost:
+    # ports:
+    #   - "127.0.0.1:1883:1883"
+    networks:
+      - ai_net
+
+  # Frigate = local NVR (Network Video Recorder).
+  # NVR = a "camera recorder" app that ingests camera streams and saves events/clips locally.
+  #
+  # It will:
+  # - Ingest RTSP from your camera (RTSP = camera video stream protocol on LAN)
+  # - Run detection (CPU for MVP; later GPU/Coral)
+  # - Create alerts/detections and keep those "event" segments
+  # - Provide a UI + live view via WebRTC (low-latency live video in browser)
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: ai-cam-frigate
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    shm_size: "512mb"
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+    volumes:
+      # Rendered config file. We render into ./data/config/ so secrets never live in git.
+      - ./data/config/frigate.yml:/config/config.yml:ro
+      - ./data/frigate:/data
+      # Media outputs (host paths)
+      - ./data/recordings:/media/frigate/recordings
+      - ./data/clips:/media/frigate/clips
+      - ./data/logs/frigate:/var/log/frigate
+      - ./data/models:/config/model_cache
+    # UI ports (restrict these on the Windows firewall to Tailscale only).
+    # Tip: set UI_BIND_ADDR to your Windows host's Tailscale IP (100.x.y.z) to avoid LAN exposure.
+    ports:
+      # Publish on localhost so browser mic/camera features work without HTTPS.
+      - "127.0.0.1:5000:5000"
+      # Publish on Tailscale interface for phone access.
+      - "${UI_BIND_ADDR}:5000:5000"
+      # WebRTC for live view (Frigate/go2rtc)
+      - "127.0.0.1:8555:8555/tcp"
+      - "127.0.0.1:8555:8555/udp"
+      - "${UI_BIND_ADDR}:8555:8555/tcp"
+      - "${UI_BIND_ADDR}:8555:8555/udp"
+      # go2rtc admin UI (keep local)
+      - "127.0.0.1:1984:1984"
+    # Optional hardware acceleration (uncomment what you actually have):
+    # devices:
+    #   - /dev/dri:/dev/dri                 # Intel/AMD iGPU (VAAPI)
+    #   - /dev/bus/usb:/dev/bus/usb         # Coral USB
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    networks:
+      - ai_net
+
+  # Home Assistant = your local smart-home hub.
+  # It provides:
+  # - a dashboard UI
+  # - automations ("if X then do Y")
+  # - integrations (Frigate, MQTT, notifications, voice, etc)
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    container_name: ai-cam-homeassistant
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+    volumes:
+      - ./data/homeassistant:/config
+      - /etc/localtime:/etc/localtime:ro
+    extra_hosts:
+      # Makes `host.docker.internal` work even on hosts where Docker doesn't add it automatically.
+      # We use this when Home Assistant needs to reach something running on the Windows host
+      # (example: Ollama on Windows for GPU speed).
+      - "host.docker.internal:host-gateway"
+    ports:
+      # Publish on localhost so browser mic/camera features work without HTTPS.
+      - "127.0.0.1:8123:8123"
+      # Publish on Tailscale interface for phone access.
+      - "${UI_BIND_ADDR}:8123:8123"
+    networks:
+      - ai_net
+
+  # AI Hub = central policy + routing + memory service.
+  # This is where triggers are normalized and routed to local actions / local brain / Codex route.
+  # Security: internal-only (`expose`), no host-published port.
+  aihub:
+    build:
+      context: ./ai-hub
+    container_name: ai-cam-aihub
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+      # If empty, token auth is disabled (internal Docker network only).
+      AIHUB_TOKEN: ${AIHUB_TOKEN:-}
+      AIHUB_DB_PATH: /data/aihub.db
+      # Routing profiles: local_first | codex_first
+      AIHUB_ROUTING_PROFILE: ${AIHUB_ROUTING_PROFILE:-codex_first}
+      # 0 = block camera-derived text to Codex unless explicit command; 1 = allow.
+      AIHUB_ALLOW_CAMERA_TEXT_TO_CODEX: ${AIHUB_ALLOW_CAMERA_TEXT_TO_CODEX:-0}
+      # 1 = ignore audio turns unless wake phrase or active conversation window exists.
+      AIHUB_AUDIO_REQUIRE_WAKE_OR_ACTIVE: ${AIHUB_AUDIO_REQUIRE_WAKE_OR_ACTIVE:-1}
+      AIHUB_CONVERSATION_TTL_SEC: ${AIHUB_CONVERSATION_TTL_SEC:-90}
+      AIHUB_CODEX_URL: ${AIHUB_CODEX_URL:-http://codex-gateway:8090/v1/ask}
+      AIHUB_CODEX_TOKEN: ${AIHUB_CODEX_TOKEN:-}
+      AIHUB_CODEX_TIMEOUT_SEC: ${AIHUB_CODEX_TIMEOUT_SEC:-120}
+      AIHUB_CAMERA_SPEAK_ENABLED: ${AIHUB_CAMERA_SPEAK_ENABLED:-0}
+      AIHUB_CAMERA_SPEAK_URL: ${AIHUB_CAMERA_SPEAK_URL:-http://camera-voice-bridge:8091/v1/speak}
+      AIHUB_CAMERA_SPEAK_TOKEN: ${AIHUB_CAMERA_SPEAK_TOKEN:-}
+      AIHUB_CAMERA_SPEAK_TIMEOUT_SEC: ${AIHUB_CAMERA_SPEAK_TIMEOUT_SEC:-20}
+      AIHUB_CAMERA_SPEAK_SOURCE_FILTER: ${AIHUB_CAMERA_SPEAK_SOURCE_FILTER:-audio}
+      AIHUB_CAMERA_SPEAK_STREAM: ${AIHUB_CAMERA_SPEAK_STREAM:-}
+      # Reolink PTZ
+      AIHUB_REOLINK_HOST: ${AIHUB_REOLINK_HOST:-}
+      AIHUB_REOLINK_USER: ${AIHUB_REOLINK_USER:-admin}
+      AIHUB_REOLINK_PASSWORD: ${AIHUB_REOLINK_PASSWORD:-}
+      AIHUB_REOLINK_TIMEOUT_SEC: ${AIHUB_REOLINK_TIMEOUT_SEC:-5}
+      # Ollama vision
+      AIHUB_OLLAMA_BASE_URL: ${AIHUB_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      AIHUB_OLLAMA_VISION_MODEL: ${AIHUB_OLLAMA_VISION_MODEL:-llama3.2-vision}
+      AIHUB_OLLAMA_CORRECTOR_MODEL: ${AIHUB_OLLAMA_CORRECTOR_MODEL:-llama3.1:8b}
+      AIHUB_OLLAMA_CORRECTOR_TIMEOUT_SEC: ${AIHUB_OLLAMA_CORRECTOR_TIMEOUT_SEC:-5}
+      AIHUB_OLLAMA_TIMEOUT_SEC: ${AIHUB_OLLAMA_TIMEOUT_SEC:-30}
+      # Snapshot
+      AIHUB_GO2RTC_BASE_URL: ${AIHUB_GO2RTC_BASE_URL:-http://frigate:1984}
+      AIHUB_SNAPSHOT_STREAM: ${AIHUB_SNAPSHOT_STREAM:-reolink_e1pro_main}
+    volumes:
+      - ./data/aihub:/data
+    expose:
+      - "8080"
+    depends_on:
+      - codex-gateway
+      - camera-voice-bridge
+    networks:
+      - ai_net
+
+  # Codex Gateway = project-local container that provides a stable text API for Codex.
+  # It accepts text + memory context from aihub and returns text.
+  # Security: internal-only, no host-published port.
+  codex-gateway:
+    build:
+      context: ./codex-gateway
+    container_name: ai-cam-codex-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # If empty, gateway auth is disabled on Docker network.
+      CODEX_GATEWAY_TOKEN: ${CODEX_GATEWAY_TOKEN:-}
+      # Backend:
+      # - codex_cli: uses `codex login --device-auth` session (no API key needed)
+      # - openai: direct API-key flow (optional fallback)
+      CODEX_GATEWAY_BACKEND: ${CODEX_GATEWAY_BACKEND:-codex_cli}
+      # Optional model override for codex exec / openai backend.
+      CODEX_MODEL: ${CODEX_MODEL:-}
+      # CLI runtime settings.
+      CODEX_TIMEOUT_SEC: ${CODEX_TIMEOUT_SEC:-60}
+      # Sandbox controls local command/file access for Codex CLI.
+      # Keep read-only for safest operation; use workspace-write if you want tool actions that write files.
+      CODEX_CLI_SANDBOX: ${CODEX_CLI_SANDBOX:-read-only}
+      # Approval mode for Codex CLI. `never` avoids interactive prompts in gateway mode.
+      CODEX_CLI_APPROVAL: ${CODEX_CLI_APPROVAL:-never}
+      # 1 = allow Codex web search tool, 0 = disable web search.
+      CODEX_CLI_ENABLE_SEARCH: ${CODEX_CLI_ENABLE_SEARCH:-1}
+      CODEX_CLI_BIN: ${CODEX_CLI_BIN:-codex}
+      CODEX_THREAD_MAP_FILE: ${CODEX_THREAD_MAP_FILE:-/root/.codex/conversation_threads.json}
+      # Only needed for backend=openai
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      # Persist Codex OAuth/device-auth session so login survives recreate/restart.
+      - ./data/codex-auth:/root/.codex
+    expose:
+      - "8090"
+    networks:
+      - ai_net
+
+  # Camera Voice Bridge = dynamic TTS playback to camera speaker via go2rtc.
+  # Flow:
+  # - Receives text from AIHub
+  # - Generates WAV via edge-tts (Microsoft Sofie)
+  # - Pushes generated audio to go2rtc stream (camera backchannel path)
+  # Security: internal-only.
+  camera-voice-bridge:
+    build:
+      context: ./camera-voice-bridge
+    container_name: ai-cam-camera-voice-bridge
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CAMERA_VOICE_BRIDGE_TOKEN: ${CAMERA_VOICE_BRIDGE_TOKEN:-}
+      CAMERA_VOICE_EDGE_TTS_VOICE: ${CAMERA_VOICE_EDGE_TTS_VOICE:-sv-SE-SofieNeural}
+      CAMERA_VOICE_GAIN_DB: ${CAMERA_VOICE_GAIN_DB:-14}
+      CAMERA_VOICE_AUDIO_RETENTION_SEC: ${CAMERA_VOICE_AUDIO_RETENTION_SEC:-900}
+      CAMERA_VOICE_AIHUB_URL: ${CAMERA_VOICE_AIHUB_URL:-http://aihub:8080}
+      CAMERA_VOICE_AUDIO_BRIDGE_URL: ${CAMERA_VOICE_AUDIO_BRIDGE_URL:-http://host.docker.internal:8092}
+      CAMERA_VOICE_AUDIO_BRIDGE_TOKEN: ${CAMERA_VOICE_AUDIO_BRIDGE_TOKEN:-}
+      CAMERA_VOICE_AUDIO_BRIDGE_CALLER: ${CAMERA_VOICE_AUDIO_BRIDGE_CALLER:-camera-voice-bridge}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/camera-voice-bridge:/data
+    expose:
+      - "8091"
+    networks:
+      - ai_net
+
+  # Camera Listener = always-on local mic listener from camera RTSP audio.
+  # Privacy policy:
+  # - Raw audio never leaves Docker network.
+  # - Raw audio is processed in-memory and not persisted.
+  # - Forwarding to AIHub happens only after wake phrase, then during active TTL window.
+  camera-listener:
+    build:
+      context: ./camera-listener
+    container_name: ai-cam-camera-listener
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      CAMERA_LISTENER_ENABLED: ${CAMERA_LISTENER_ENABLED:-1}
+      CAMERA_LISTENER_RTSP_URL: ${CAMERA_LISTENER_RTSP_URL:-rtsp://frigate:8554/reolink_e1pro_main}
+      CAMERA_LISTENER_DEVICE_ID: ${CAMERA_LISTENER_DEVICE_ID:-reolink_mic}
+      CAMERA_LISTENER_AIHUB_URL: ${CAMERA_LISTENER_AIHUB_URL:-http://aihub:8080}
+      CAMERA_LISTENER_AIHUB_TOKEN: ${CAMERA_LISTENER_AIHUB_TOKEN:-}
+      CAMERA_LISTENER_ALLOW_CODEX: ${CAMERA_LISTENER_ALLOW_CODEX:-1}
+      CAMERA_LISTENER_WAKE_PHRASES: ${CAMERA_LISTENER_WAKE_PHRASES:-hej codex,hey codex}
+      CAMERA_LISTENER_WAKE_ALIASES: ${CAMERA_LISTENER_WAKE_ALIASES:-hej codex,hey codex,hej kodex,hey kodex}
+      CAMERA_LISTENER_STOP_PHRASES: ${CAMERA_LISTENER_STOP_PHRASES:-stopp codex,stopp kodex,sluta codex,sluta kodex}
+      CAMERA_LISTENER_STT_BACKEND: ${CAMERA_LISTENER_STT_BACKEND:-local}
+      CAMERA_LISTENER_STT_MODEL: ${CAMERA_LISTENER_STT_MODEL:-small}
+      CAMERA_LISTENER_STT_DEVICE: ${CAMERA_LISTENER_STT_DEVICE:-cpu}
+      CAMERA_LISTENER_STT_COMPUTE_TYPE: ${CAMERA_LISTENER_STT_COMPUTE_TYPE:-int8}
+      CAMERA_LISTENER_STT_LANGUAGE: ${CAMERA_LISTENER_STT_LANGUAGE:-sv}
+      CAMERA_LISTENER_MODEL_DIR: ${CAMERA_LISTENER_MODEL_DIR:-/data/models}
+      CAMERA_LISTENER_STT_BEAM_SIZE: ${CAMERA_LISTENER_STT_BEAM_SIZE:-1}
+      CAMERA_LISTENER_STT_BEST_OF: ${CAMERA_LISTENER_STT_BEST_OF:-1}
+      CAMERA_LISTENER_STT_NO_SPEECH_THRESHOLD: ${CAMERA_LISTENER_STT_NO_SPEECH_THRESHOLD:-0.55}
+      CAMERA_LISTENER_STT_LOGPROB_THRESHOLD: ${CAMERA_LISTENER_STT_LOGPROB_THRESHOLD:--0.8}
+      CAMERA_LISTENER_SEGMENT_MIN_AVG_LOGPROB: ${CAMERA_LISTENER_SEGMENT_MIN_AVG_LOGPROB:--0.9}
+      CAMERA_LISTENER_SEGMENT_MAX_NO_SPEECH_PROB: ${CAMERA_LISTENER_SEGMENT_MAX_NO_SPEECH_PROB:-0.6}
+      CAMERA_LISTENER_WAKE_ONLY_MODE: ${CAMERA_LISTENER_WAKE_ONLY_MODE:-1}
+      CAMERA_LISTENER_WAKE_STT_MODEL: ${CAMERA_LISTENER_WAKE_STT_MODEL:-tiny}
+      CAMERA_LISTENER_WAKE_STT_DEVICE: ${CAMERA_LISTENER_WAKE_STT_DEVICE:-cpu}
+      CAMERA_LISTENER_WAKE_STT_COMPUTE_TYPE: ${CAMERA_LISTENER_WAKE_STT_COMPUTE_TYPE:-int8}
+      CAMERA_LISTENER_WAKE_STT_LANGUAGE: ${CAMERA_LISTENER_WAKE_STT_LANGUAGE:-sv}
+      CAMERA_LISTENER_WAKE_STT_BEAM_SIZE: ${CAMERA_LISTENER_WAKE_STT_BEAM_SIZE:-1}
+      CAMERA_LISTENER_WAKE_STT_BEST_OF: ${CAMERA_LISTENER_WAKE_STT_BEST_OF:-1}
+      CAMERA_LISTENER_WAKE_STT_NO_SPEECH_THRESHOLD: ${CAMERA_LISTENER_WAKE_STT_NO_SPEECH_THRESHOLD:-0.7}
+      CAMERA_LISTENER_WAKE_STT_LOGPROB_THRESHOLD: ${CAMERA_LISTENER_WAKE_STT_LOGPROB_THRESHOLD:--0.4}
+      CAMERA_LISTENER_WAKE_SEGMENT_MIN_AVG_LOGPROB: ${CAMERA_LISTENER_WAKE_SEGMENT_MIN_AVG_LOGPROB:--1.6}
+      CAMERA_LISTENER_WAKE_SEGMENT_MAX_NO_SPEECH_PROB: ${CAMERA_LISTENER_WAKE_SEGMENT_MAX_NO_SPEECH_PROB:-0.98}
+      CAMERA_LISTENER_WAKE_ALLOW_FUZZY_MATCH: ${CAMERA_LISTENER_WAKE_ALLOW_FUZZY_MATCH:-0}
+      CAMERA_LISTENER_SAMPLE_RATE: ${CAMERA_LISTENER_SAMPLE_RATE:-16000}
+      CAMERA_LISTENER_CHUNK_SEC: ${CAMERA_LISTENER_CHUNK_SEC:-1.2}
+      CAMERA_LISTENER_MIN_DBFS: ${CAMERA_LISTENER_MIN_DBFS:--42}
+      CAMERA_LISTENER_MAX_PENDING_CHUNKS: ${CAMERA_LISTENER_MAX_PENDING_CHUNKS:-3}
+      CAMERA_LISTENER_VAD_MODE: ${CAMERA_LISTENER_VAD_MODE:-2}
+      CAMERA_LISTENER_VAD_FRAME_MS: ${CAMERA_LISTENER_VAD_FRAME_MS:-30}
+      CAMERA_LISTENER_VAD_START_FRAMES: ${CAMERA_LISTENER_VAD_START_FRAMES:-3}
+      CAMERA_LISTENER_VAD_END_FRAMES: ${CAMERA_LISTENER_VAD_END_FRAMES:-14}
+      CAMERA_LISTENER_VAD_PREROLL_FRAMES: ${CAMERA_LISTENER_VAD_PREROLL_FRAMES:-6}
+      CAMERA_LISTENER_VAD_MIN_SPEECH_MS: ${CAMERA_LISTENER_VAD_MIN_SPEECH_MS:-240}
+      CAMERA_LISTENER_VAD_MAX_SPEECH_SEC: ${CAMERA_LISTENER_VAD_MAX_SPEECH_SEC:-8}
+      CAMERA_LISTENER_MIN_TEXT_LEN: ${CAMERA_LISTENER_MIN_TEXT_LEN:-3}
+      CAMERA_LISTENER_WAKE_COOLDOWN_SEC: ${CAMERA_LISTENER_WAKE_COOLDOWN_SEC:-3}
+      CAMERA_LISTENER_CONVERSATION_TTL_SEC: ${CAMERA_LISTENER_CONVERSATION_TTL_SEC:-90}
+      CAMERA_LISTENER_MIN_TURN_INTERVAL_SEC: ${CAMERA_LISTENER_MIN_TURN_INTERVAL_SEC:-1.2}
+      CAMERA_LISTENER_DUPLICATE_WINDOW_SEC: ${CAMERA_LISTENER_DUPLICATE_WINDOW_SEC:-8}
+      CAMERA_LISTENER_ASSISTANT_ECHO_GUARD_SEC: ${CAMERA_LISTENER_ASSISTANT_ECHO_GUARD_SEC:-5}
+      CAMERA_LISTENER_ECHO_SIMILARITY_THRESHOLD: ${CAMERA_LISTENER_ECHO_SIMILARITY_THRESHOLD:-0.84}
+      CAMERA_LISTENER_MIN_WORDS_FORWARD: ${CAMERA_LISTENER_MIN_WORDS_FORWARD:-2}
+      CAMERA_LISTENER_FILLER_WORDS: ${CAMERA_LISTENER_FILLER_WORDS:-ja,nej,okej,ok,tack,hej,dag,mm,mhm}
+      CAMERA_LISTENER_DIRECTED_HINT_WORDS: ${CAMERA_LISTENER_DIRECTED_HINT_WORDS:-codex,kan du,hjälp,visa,berätta,påminn,förklara}
+      CAMERA_LISTENER_DIRECTED_MIN_SCORE: ${CAMERA_LISTENER_DIRECTED_MIN_SCORE:-1.4}
+      CAMERA_LISTENER_FFMPEG_AUDIO_FILTER: ${CAMERA_LISTENER_FFMPEG_AUDIO_FILTER:-highpass=f=100,lowpass=f=3700,volume=2.5}
+      CAMERA_LISTENER_RECONNECT_DELAY_SEC: ${CAMERA_LISTENER_RECONNECT_DELAY_SEC:-1.5}
+      CAMERA_LISTENER_STATUS_PATH: ${CAMERA_LISTENER_STATUS_PATH:-/data/status.json}
+      CAMERA_LISTENER_LOG_LEVEL: ${CAMERA_LISTENER_LOG_LEVEL:-INFO}
+      CAMERA_LISTENER_DEBUG_TRANSCRIPTS: ${CAMERA_LISTENER_DEBUG_TRANSCRIPTS:-0}
+      CAMERA_LISTENER_WAKEWORD_ENGINE: ${CAMERA_LISTENER_WAKEWORD_ENGINE:-openwakeword}
+      CAMERA_LISTENER_OWW_MODEL: ${CAMERA_LISTENER_OWW_MODEL:-hey_jarvis}
+      CAMERA_LISTENER_OWW_THRESHOLD: ${CAMERA_LISTENER_OWW_THRESHOLD:-0.5}
+      CAMERA_LISTENER_SILERO_VAD_THRESHOLD: ${CAMERA_LISTENER_SILERO_VAD_THRESHOLD:-0.4}
+      CAMERA_LISTENER_BARGE_IN_ENABLED: ${CAMERA_LISTENER_BARGE_IN_ENABLED:-1}
+      CAMERA_LISTENER_BARGE_IN_MIN_DBFS: ${CAMERA_LISTENER_BARGE_IN_MIN_DBFS:--50}
+      CAMERA_LISTENER_BARGE_IN_IGNORE_SPEAKER_SEC: ${CAMERA_LISTENER_BARGE_IN_IGNORE_SPEAKER_SEC:-4}
+      CAMERA_LISTENER_BARGE_IN_INTERRUPT_SPEAKER: ${CAMERA_LISTENER_BARGE_IN_INTERRUPT_SPEAKER:-1}
+      CAMERA_LISTENER_DEBUG_AUDIO_DIR: ${CAMERA_LISTENER_DEBUG_AUDIO_DIR:-}
+      CAMERA_LISTENER_INITIAL_PROMPT: ${CAMERA_LISTENER_INITIAL_PROMPT:-}
+    volumes:
+      - ./data/camera-listener:/data
+    depends_on:
+      - aihub
+      - frigate
+    networks:
+      - ai_net
+
+  # Ollama = local LLM server (ChatGPT-like "brain").
+  # LLM = Large Language Model, i.e. a chatbot model you run locally.
+  #
+  # Home Assistant can use this as the conversation agent to get a more "AI" feel.
+  # Security: keep it internal-only (expose, no ports) unless you have a reason to debug from the host.
+  ollama:
+    # Optional: keep this service disabled by default.
+    # In WSL2 + Docker Desktop, Ollama-in-Docker often falls back to CPU (slow).
+    # Recommended: run Ollama on the Windows host (GPU) and point Home Assistant to:
+    #   http://host.docker.internal:11434
+    profiles: ["docker-ollama"]
+    image: ollama/ollama:latest
+    container_name: ai-cam-ollama
+    restart: unless-stopped
+    volumes:
+      # Model downloads and cache (persistent, gitignored).
+      - ./data/ollama:/root/.ollama
+    environment:
+      # Listen on the container network (Home Assistant will reach http://ollama:11434).
+      OLLAMA_HOST: 0.0.0.0:11434
+    expose:
+      - "11434"
+    # Note on GPU:
+    # In this WSL2 + Docker Desktop setup, we verified that containers can access the GPU
+    # (`docker run --gpus all ... nvidia-smi` works), but the current `ollama/ollama` image
+    # still falls back to CPU in our environment. We'll switch to a different GPU LLM server
+    # (or run Ollama on the Windows host) when you want to optimize latency.
+    networks:
+      - ai_net
+
+  # MediaMTX (optional) = RTSP proxy/router.
+  # RTSP proxy = a local middleman that "re-publishes" camera RTSP streams.
+  # Useful if you want:
+  # - stable internal RTSP names (reolink_main/reolink_sub)
+  # - on-demand pulling (camera stream only when needed)
+  mediamtx:
+    image: ghcr.io/bluenviron/mediamtx:latest
+    container_name: ai-cam-mediamtx
+    profiles: ["rtsp-proxy"]
+    restart: unless-stopped
+    environment:
+      MTX_LOGLEVEL: info
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
+      - ./data/logs/mediamtx:/logs
+    ports:
+      # Proxy is not a UI port; keep it local unless you explicitly need otherwise.
+      - "127.0.0.1:8554:8554" # RTSP
+      - "127.0.0.1:8888:8888" # HTTP
+    networks:
+      - ai_net
+
+networks:
+  # Named network so helper scripts can reference it reliably.
+  ai_net:
+    name: ai-cam-net
+    driver: bridge
