@@ -10,6 +10,11 @@ data/
 # rendered runtime configs (kept in data/, but this clarifies intent)
 # data/config/frigate.yml
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
 # OS / IDE
 .DS_Store
 Thumbs.db
