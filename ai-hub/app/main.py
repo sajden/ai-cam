@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
@@ -21,11 +22,16 @@ except Exception:  # pragma: no cover
     Image = None
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import db
 from .actions import (
+    control_air_purifier,
+    control_lights,
+    control_tv,
     execute_route_actions,
+    get_ha_state,
     get_current_track,
     interrupt_camera_speaker,
     load_ha_config,
@@ -36,8 +42,19 @@ from .actions import (
     prev_track,
     speak_to_camera,
 )
-from .spotify_client import search_spotify
-from .codex_client import ask_codex, should_send_processing_ack
+from .spotify_client import (
+    search_spotify,
+    build_auth_url,
+    exchange_code,
+    find_user_playlist,
+    play_liked_songs,
+    play_context_uri,
+    has_user_auth,
+    is_liked_songs_uri,
+)
+from .codex_client import ask_codex, build_system_prompt, should_send_processing_ack
+from . import response_pool
+from .response_pool import PoolContext
 from .intent_detector import detect_camera_intent
 from .follow_tracker import SoftFollowController
 from .live_video import LiveVideoFeed
@@ -211,6 +228,152 @@ LATENCY_BUDGET_TTS_REQUEST_MS = float(
     os.getenv("AIHUB_LATENCY_BUDGET_TTS_REQUEST_MS", "1500")
 )
 
+# Follow-up remark config (T021)
+FOLLOWUP_DELAY_SEC = float(os.getenv("AIHUB_FOLLOWUP_DELAY_SEC", "1.5"))
+FOLLOWUP_PROBABILITY = float(os.getenv("AIHUB_FOLLOWUP_PROBABILITY", "0.30"))
+
+# Minimal mode verbal confirmations (T032)
+MINIMAL_MODE_ON_ACK_TEXT = os.getenv(
+    "AIHUB_MINIMAL_MODE_ON_ACK_TEXT", "Okej, jag svarar kortare."
+).strip()
+MINIMAL_MODE_OFF_ACK_TEXT = os.getenv(
+    "AIHUB_MINIMAL_MODE_OFF_ACK_TEXT", "Okej, jag svarar som vanligt igen."
+).strip()
+
+# Minimal mode detection patterns (T031)
+_MINIMAL_MODE_ON = re.compile(
+    r"\b(svara|prata|var)\b.{0,20}\b(kort(are)?|enkelt|koncist|direkt|kortfattat)\b",
+    re.IGNORECASE,
+)
+_MINIMAL_MODE_OFF = re.compile(
+    r"\b(svara|prata|var)\b.{0,20}\b(normalt?|som vanligt|utf(ö|o)rligt)\b",
+    re.IGNORECASE,
+)
+
+_LIGHT_TARGET = re.compile(
+    r"\b(lamporn?a?|ljuset|kronan?|takkronan?|belysning(en)?|lyset)\b",
+    re.IGNORECASE,
+)
+_LIGHT_ON_VERB = re.compile(r"\b(tänd|slå på|sätt på|aktivera)\b", re.IGNORECASE)
+_LIGHT_OFF_VERB = re.compile(r"\b(släck|slå av|stäng av|avaktivera)\b", re.IGNORECASE)
+_LIGHT_DIM_PCT = re.compile(
+    r"\b(dimma|sätt|ändra|justera)\b.{0,25}?(?P<pct>\d+)\s*(%|procent)"
+    r"|\b(?P<pct2>\d+)\s*(%|procent)\s*(ljus|lampa|belysning|dimmer)\b",
+    re.IGNORECASE,
+)
+_LIGHT_FULL = re.compile(r"\b(full(t)?|hundra|max)\s*(ljus|lampor|belysning)\b", re.IGNORECASE)
+_LIGHT_HALF = re.compile(r"\b(halv(t)?)\s*(ljus|lampor|belysning)\b", re.IGNORECASE)
+
+_LIGHT_COLORS: list[tuple[re.Pattern[str], tuple[int, int, int]]] = [
+    (re.compile(r"\brö(d|tt?)\b", re.IGNORECASE), (255, 0, 0)),
+    (re.compile(r"\bblå\b", re.IGNORECASE), (0, 0, 255)),
+    (re.compile(r"\bgrö(n|nt?)\b", re.IGNORECASE), (0, 200, 0)),
+    (re.compile(r"\blila\b|\bviolett?\b", re.IGNORECASE), (128, 0, 200)),
+    (re.compile(r"\borange\b", re.IGNORECASE), (255, 100, 0)),
+    (re.compile(r"\brosa\b|\bpink\b", re.IGNORECASE), (255, 20, 130)),
+    (re.compile(r"\bgul\b", re.IGNORECASE), (255, 220, 0)),
+    (re.compile(r"\bturkos\b|\bcyan\b", re.IGNORECASE), (0, 220, 200)),
+]
+_LIGHT_WARM = re.compile(r"\b(varm)\s*(vit|ljus|belysning)\b", re.IGNORECASE)
+_LIGHT_COOL = re.compile(r"\b(kall|cool|kallvit)\s*(vit|ljus|belysning)?\b", re.IGNORECASE)
+_LIGHT_NEUTRAL = re.compile(r"\bneutralt?\s*(vit|ljus|belysning)?\b", re.IGNORECASE)
+
+
+def _detect_light_intent(text: str) -> dict | None:
+    """Parse Swedish light control commands. Returns kwargs for control_lights() or None."""
+    has_target = bool(_LIGHT_TARGET.search(text))
+
+    if _LIGHT_OFF_VERB.search(text) and has_target:
+        return {"command": "off"}
+
+    # Brightness: "dimma till 40%" / "sätt lamporna på 80 procent"
+    m = _LIGHT_DIM_PCT.search(text)
+    if m:
+        raw_pct = m.group("pct") or m.group("pct2")
+        if raw_pct:
+            return {"command": "on", "brightness_pct": max(1, min(100, int(raw_pct)))}
+
+    if _LIGHT_FULL.search(text):
+        return {"command": "on", "brightness_pct": 100}
+    if _LIGHT_HALF.search(text):
+        return {"command": "on", "brightness_pct": 50}
+
+    # Color temperature (need light context)
+    if has_target or _LIGHT_ON_VERB.search(text):
+        if _LIGHT_WARM.search(text):
+            return {"command": "on", "color_temp_kelvin": 2700}
+        if _LIGHT_COOL.search(text):
+            return {"command": "on", "color_temp_kelvin": 5000}
+        if _LIGHT_NEUTRAL.search(text):
+            return {"command": "on", "color_temp_kelvin": 3500}
+
+    # RGB colors — require a light target to avoid false positives
+    if has_target:
+        for pattern, rgb in _LIGHT_COLORS:
+            if pattern.search(text):
+                return {"command": "on", "rgb_color": rgb}
+
+    if _LIGHT_ON_VERB.search(text) and has_target:
+        return {"command": "on"}
+
+    return None
+
+
+_AIR_TARGET = re.compile(
+    r"\b(luftrenaren?|luftfuktaren?|fläkten?|renaren?|fuktaren?|philips)\b",
+    re.IGNORECASE,
+)
+_AIR_ON = re.compile(r"\b(sätt på|slå på|starta|aktivera|tänd)\b", re.IGNORECASE)
+_AIR_OFF = re.compile(r"\b(stäng av|slå av|stäng|stoppa|avaktivera|släck)\b", re.IGNORECASE)
+_AIR_TURBO = re.compile(r"\b(turbo|full(t)?|max(imum)?)\b", re.IGNORECASE)
+_AIR_SLEEP = re.compile(r"\b(natt(läge)?|sömn(läge)?|tyst(läge)?|sleep)\b", re.IGNORECASE)
+_AIR_AUTO = re.compile(r"\b(auto(läge)?|normal(läge)?)\b", re.IGNORECASE)
+
+_AIR_QUERY_QUALITY = re.compile(
+    r"\b(luftkvalitet|luftkval|luft kvalitet|pm2|pm 2|partikel|föroreningar?)\b",
+    re.IGNORECASE,
+)
+_AIR_QUERY_HUMIDITY = re.compile(
+    r"\b(luftfuktighe(t|ten)|fuktighet|hur fuktigt)\b",
+    re.IGNORECASE,
+)
+_AIR_QUERY_TEMP = re.compile(
+    r"\b(temperatur(en)?|hur varmt|hur kallt|grader)\b.{0,20}\b(sovrum|rum|inne|här)\b"
+    r"|\b(sovrum|rum|inne|här)\b.{0,20}\b(temperatur(en)?|hur varmt|hur kallt|grader)\b",
+    re.IGNORECASE,
+)
+
+
+def _detect_air_intent(text: str) -> dict | None:
+    """Detect air purifier control/query commands. Returns dict or None."""
+    has_target = bool(_AIR_TARGET.search(text))
+
+    # Queries — don't require air target word (natural phrasing)
+    if _AIR_QUERY_QUALITY.search(text):
+        return {"kind": "query", "sensor": "sensor.sovrum_pm2_5", "unit": "µg/m³", "label": "PM2.5-nivån i sovrummet"}
+    if _AIR_QUERY_HUMIDITY.search(text):
+        return {"kind": "query", "sensor": "sensor.sovrum_humidity", "unit": "%", "label": "Luftfuktigheten i sovrummet"}
+    if _AIR_QUERY_TEMP.search(text):
+        return {"kind": "query", "sensor": "sensor.sovrum_temperature", "unit": "°C", "label": "Temperaturen i sovrummet"}
+
+    if not has_target:
+        return None
+
+    # Control commands
+    if _AIR_OFF.search(text):
+        return {"kind": "control", "command": "off"}
+    if _AIR_TURBO.search(text):
+        return {"kind": "control", "command": "turbo"}
+    if _AIR_SLEEP.search(text):
+        return {"kind": "control", "command": "sleep"}
+    if _AIR_AUTO.search(text):
+        return {"kind": "control", "command": "auto"}
+    if _AIR_ON.search(text):
+        return {"kind": "control", "command": "on"}
+
+    return None
+
+
 app = FastAPI(title="ai-hub", version=APP_VERSION)
 
 
@@ -229,9 +392,100 @@ _PENDING_IDENTITY_EMBED_KEY = "pending_identity_embedding_json"
 _PENDING_IDENTITY_SET_AT_KEY = "pending_identity_set_at"
 _PENDING_IDENTITY_PROMPT_AT_KEY = "pending_identity_prompt_at"
 
+# Follow-up scheduler state (T021)
+_followup_cancel = threading.Event()
+_followup_lock = threading.Lock()
+_pending_followup_timer: threading.Timer | None = None
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _get_time_of_day() -> str:
+    """Returns morning/afternoon/evening/night based on local hour. (T010)"""
+    hour = datetime.now().hour
+    if 6 <= hour < 11:
+        return "morning"
+    elif 11 <= hour < 18:
+        return "afternoon"
+    elif 18 <= hour < 23:
+        return "evening"
+    else:
+        return "night"
+
+
+def _build_pool_context(conversation_id: str) -> PoolContext:
+    """Resolve identity + companion pref + recency for the given conversation. (T011)"""
+    identity = db.get_conversation_identity(conversation_id)
+    person_id: int | None = int(identity["person_id"]) if identity else None
+    identity_name: str | None = str(identity["athlete_name"]).strip() if identity else None
+
+    companion_pref = db.get_companion_pref(person_id) if person_id is not None else "full"
+    companion_mode = companion_pref != "minimal"
+
+    last_at = db.get_last_interaction_at(person_id)
+    recency = False
+    if last_at is not None:
+        diff = datetime.now(timezone.utc) - last_at
+        recency = diff.total_seconds() < 600  # < 10 minutes
+
+    return PoolContext(
+        time_of_day=_get_time_of_day(),
+        recency=recency,
+        identity_name=identity_name or None,
+        companion_mode=companion_mode,
+        last_action=None,
+    )
+
+
+def _build_wake_response(pool_ctx: PoolContext) -> str:
+    """Select wake greeting pool based on recency and time of day. (T012)"""
+    if pool_ctx.recency:
+        return response_pool.pick("wake_continuity", pool_ctx)
+    return response_pool.pick(f"wake_{pool_ctx.time_of_day}", pool_ctx)
+
+
+def _detect_minimal_mode_switch(text: str) -> str | None:
+    """Returns 'minimal_mode_on', 'minimal_mode_off', or None. (T033)"""
+    if _MINIMAL_MODE_ON.search(text):
+        return "minimal_mode_on"
+    if _MINIMAL_MODE_OFF.search(text):
+        return "minimal_mode_off"
+    return None
+
+
+def schedule_followup(text: str, source: str, delay_sec: float = FOLLOWUP_DELAY_SEC) -> None:
+    """Schedule a deferred follow-up remark; cancels any pending timer. (T022)"""
+    global _pending_followup_timer
+    with _followup_lock:
+        if _pending_followup_timer is not None:
+            _pending_followup_timer.cancel()
+        _followup_cancel.clear()
+        _text = text
+        _source = source
+
+        def _deliver() -> None:
+            if _followup_cancel.is_set():
+                return
+            try:
+                speak_to_camera(_text, _source, event="reply")
+                log.info("followup delivered: %r", _text)
+            except Exception as exc:
+                log.error("Follow-up TTS failed: %s", exc)
+
+        _pending_followup_timer = threading.Timer(delay_sec, _deliver)
+        _pending_followup_timer.daemon = True
+        _pending_followup_timer.start()
+
+
+def cancel_followup() -> None:
+    """Cancel any pending deferred follow-up remark. (T023)"""
+    global _pending_followup_timer
+    _followup_cancel.set()
+    with _followup_lock:
+        if _pending_followup_timer is not None:
+            _pending_followup_timer.cancel()
 
 
 def _require_auth(authorization: str | None = Header(default=None)) -> None:
@@ -1334,6 +1588,7 @@ def _start_vision_loop_once() -> None:
 @app.on_event("startup")
 def startup() -> None:
     db.init_db()
+    response_pool.load_lru_from_db()
     if Image is None:
         log.warning("Pillow not available; face embedding disabled")
     _start_live_video_once()
@@ -1377,6 +1632,72 @@ def ha_status() -> dict[str, Any]:
         "spotify_entity_configured": bool(cfg.spotify_entity_id),
         "dance_uri_configured": bool(cfg.dance_spotify_uri),
     }
+
+
+@app.get("/v1/spotify/auth")
+def spotify_auth() -> RedirectResponse:
+    """Redirect the browser to the Spotify authorization page."""
+    url = build_auth_url()
+    return RedirectResponse(url=url)
+
+
+@app.get("/v1/spotify/callback")
+def spotify_callback(code: str = Query(...), state: str = Query(...)) -> dict[str, Any]:
+    """Handle the OAuth callback from Spotify and exchange the code for tokens."""
+    ok = exchange_code(code, state)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Authorization failed: state mismatch or token exchange error.")
+    return {"ok": True, "message": "Authorization complete. You can close this tab."}
+
+
+@app.get("/login")
+def ha_oauth_proxy(code: str = Query(...), state: str = Query(...)) -> RedirectResponse:
+    """Proxy Spotify OAuth callback to Home Assistant's auth endpoint.
+
+    Spotcast uses http://127.0.0.1:8080/login as its redirect_uri (registered
+    in spotcast's Spotify app). This endpoint receives the code+state from
+    Spotify and forwards them to HA's local auth callback so HA can complete
+    the PKCE OAuth flow.
+    """
+    ha_callback = f"http://127.0.0.1:8123/auth/external/callback?code={code}&state={state}"
+    return RedirectResponse(url=ha_callback)
+
+
+@app.get("/v1/spotify/status", dependencies=[Depends(_require_auth)])
+def spotify_status() -> dict[str, Any]:
+    return {"ok": True, "authorized": has_user_auth()}
+
+
+class _SpotifyPlayBody(BaseModel):
+    uri: str
+    device_name: str = ""
+
+
+@app.get("/v1/spotify/devices")
+def spotify_devices() -> dict[str, Any]:
+    """List available Spotify Connect devices."""
+    from .spotify_client import _get_user_token
+    import json, urllib.request
+    token = _get_user_token()
+    if not token:
+        raise HTTPException(status_code=401, detail="no_user_token")
+    req = urllib.request.Request(
+        "https://api.spotify.com/v1/me/player/devices",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return json.loads(resp.read().decode())
+
+
+@app.post("/v1/spotify/play")
+def spotify_play(body: _SpotifyPlayBody) -> dict[str, Any]:
+    """Play a Spotify context URI on a named device via the Spotify Web API."""
+    if not body.uri:
+        raise HTTPException(status_code=400, detail="uri is required")
+    ok, reason = play_context_uri(body.uri, body.device_name or None)
+    if not ok:
+        raise HTTPException(status_code=502, detail=reason)
+    return {"ok": True}
 
 
 @app.get("/v1/integrations/codex/status", dependencies=[Depends(_require_auth)])
@@ -1513,6 +1834,7 @@ class AudioWakeRequest(BaseModel):
 
 @app.post("/v1/events/audio/wake", dependencies=[Depends(_require_auth)])
 def audio_wake(req: AudioWakeRequest) -> dict[str, Any]:
+    cancel_followup()  # T024: suppress any pending follow-up on new turn
     reused = False
     conversation_id = ""
     if STICKY_CONVERSATION:
@@ -1561,6 +1883,7 @@ class ConversationTurnRequest(BaseModel):
 
 @app.post("/v1/conversation/turn", dependencies=[Depends(_require_auth)])
 def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
+    cancel_followup()  # T024: suppress any pending follow-up on new turn
     global _last_ollama_vision_at
     req_started = time.monotonic()
     req_received_at = datetime.now(timezone.utc)
@@ -1604,7 +1927,8 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
     if wake_hit and text_without_wake.strip() == "":
         used_brain = "local"
         egress = "none"
-        assistant_text = WAKE_ACK_TEXT
+        pool_ctx = _build_pool_context(req.conversation_id)  # T013
+        assistant_text = _build_wake_response(pool_ctx)  # T013
         db.insert_turn(req.conversation_id, "user", req.text, req.source, used_brain=used_brain)
         db.insert_turn(
             req.conversation_id,
@@ -1692,7 +2016,14 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
 
             used_brain = "local"
             egress = "none"
-            assistant_text = f"Tack {candidate_name}. Jag känner igen dig nu."
+            _bind_ctx = PoolContext(  # T018
+                time_of_day=_get_time_of_day(),
+                recency=False,
+                identity_name=candidate_name,
+                companion_mode=True,
+                last_action="identity_bind",
+            )
+            assistant_text = response_pool.pick("identity_bind", _bind_ctx)  # T018
             db.insert_turn(req.conversation_id, "user", user_text, req.source, used_brain=used_brain)
             db.insert_turn(
                 req.conversation_id,
@@ -1759,11 +2090,16 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
             threading.Thread(
                 target=lambda: pause_spotify(load_ha_config()), daemon=True
             ).start()
+        _stop_ctx = _build_pool_context(req.conversation_id)  # T016, T025
+        _stop_text = response_pool.pick("training_stop", _stop_ctx)  # T016
+        if _stop_ctx.companion_mode and random.random() < FOLLOWUP_PROBABILITY:  # T025
+            _followup_text = response_pool.pick("workout_followup", _stop_ctx)
+            schedule_followup(_followup_text, req.source)
         return _reply_local_turn(
             conversation_id=req.conversation_id,
             source=req.source,
             user_text=user_text,
-            assistant_text="Okej, jag stoppar träningsläget nu.",
+            assistant_text=_stop_text,
             route_id="R7",
             intent="task_stop",
             decision_reason="voice_task_stop",
@@ -1814,17 +2150,114 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
             threading.Thread(
                 target=lambda: play_spotify_uri(load_ha_config(), _workout_uri), daemon=True
             ).start()
+        _start_ctx = _build_pool_context(req.conversation_id)  # T017
+        _start_ctx = PoolContext(
+            time_of_day=_start_ctx.time_of_day,
+            recency=_start_ctx.recency,
+            identity_name=athlete_name,
+            companion_mode=_start_ctx.companion_mode,
+            last_action="training_start",
+        )
         return _reply_local_turn(
             conversation_id=req.conversation_id,
             source=req.source,
             user_text=user_text,
-            assistant_text=(
-                f"Okej {athlete_name}, träningsläget är igång. "
-                "Jag börjar räkna reps nu."
-            ),
+            assistant_text=response_pool.pick("training_start_named", _start_ctx),  # T017
             route_id="R6",
             intent="task_start",
             decision_reason="voice_task_start",
+            req_started=req_started,
+            stt_to_aihub_ms=stt_to_aihub_ms,
+        )
+
+    # Minimal mode pre-flight: detect verbal mode switch before any intent routing (T034)
+    _mode_switch = _detect_minimal_mode_switch(user_text)
+    if _mode_switch is not None:
+        _identity = db.get_conversation_identity(req.conversation_id)
+        _person_id = int(_identity["person_id"]) if _identity else None
+        if _person_id is not None:
+            _new_pref = "minimal" if _mode_switch == "minimal_mode_on" else "full"
+            db.set_companion_pref(_person_id, _new_pref)
+        _ack_mode_text = MINIMAL_MODE_ON_ACK_TEXT if _mode_switch == "minimal_mode_on" else MINIMAL_MODE_OFF_ACK_TEXT
+        log.info("Minimal mode switch: %s (person_id=%s)", _mode_switch, _person_id)
+        return _reply_local_turn(
+            conversation_id=req.conversation_id,
+            source=req.source,
+            user_text=user_text,
+            assistant_text=_ack_mode_text,
+            route_id="R14",
+            intent=_mode_switch,
+            decision_reason="minimal_mode_switch",
+            req_started=req_started,
+            stt_to_aihub_ms=stt_to_aihub_ms,
+        )
+
+    # Light control pre-flight (R15) — before camera intent to avoid ambiguity
+    _light_intent = _detect_light_intent(user_text)
+    if _light_intent is not None:
+        _ha_cfg = load_ha_config()
+        _light_ok, _light_reason = control_lights(_ha_cfg, **_light_intent)
+        _cmd = _light_intent.get("command", "on")
+        if not _light_ok:
+            _light_ack = response_pool.pick("error_generic", _build_pool_context(req.conversation_id))
+            log.warning("Light control failed (%s): %s", _cmd, _light_reason)
+        elif _cmd == "off":
+            _light_ack = "Lamporna är släckta."
+        elif "brightness_pct" in _light_intent:
+            _light_ack = f"Ljuset är satt till {_light_intent['brightness_pct']} procent."
+        elif "rgb_color" in _light_intent:
+            _light_ack = "Färgen är ändrad."
+        elif "color_temp_kelvin" in _light_intent:
+            _k = _light_intent["color_temp_kelvin"]
+            _light_ack = "Varmt ljus." if _k <= 3000 else "Svalt ljus." if _k >= 4500 else "Neutralt ljus."
+        else:
+            _light_ack = "Lamporna är tända."
+        return _reply_local_turn(
+            conversation_id=req.conversation_id,
+            source=req.source,
+            user_text=user_text,
+            assistant_text=_light_ack,
+            route_id="R15",
+            intent="light_control",
+            decision_reason=f"light:{_cmd}",
+            req_started=req_started,
+            stt_to_aihub_ms=stt_to_aihub_ms,
+        )
+
+    # Air purifier control/query (R16)
+    _air_intent = _detect_air_intent(user_text)
+    if _air_intent is not None:
+        _ha_cfg = load_ha_config()
+        if _air_intent["kind"] == "query":
+            _val, _reason = get_ha_state(_ha_cfg, _air_intent["sensor"])
+            if _val is not None:
+                _air_ack = f"{_air_intent['label']} är {_val} {_air_intent['unit']}."
+            else:
+                _air_ack = response_pool.pick("error_generic", _build_pool_context(req.conversation_id))
+        else:
+            _ok, _reason = control_air_purifier(_ha_cfg, _air_intent["command"])
+            _cmd = _air_intent["command"]
+            if not _ok:
+                _air_ack = response_pool.pick("error_generic", _build_pool_context(req.conversation_id))
+                log.warning("Air purifier control failed (%s): %s", _cmd, _reason)
+            elif _cmd == "off":
+                _air_ack = "Luftrenaren är avstängd."
+            elif _cmd == "on":
+                _air_ack = "Luftrenaren är påslagen."
+            elif _cmd == "turbo":
+                _air_ack = "Luftrenaren körs på full effekt."
+            elif _cmd == "sleep":
+                _air_ack = "Luftrenaren är i nattläge."
+            else:
+                _air_ack = "Klart."
+        return _reply_local_turn(
+            conversation_id=req.conversation_id,
+            source=req.source,
+            user_text=user_text,
+            assistant_text=_air_ack,
+            route_id="R16",
+            intent="air_purifier",
+            decision_reason=f"air:{_air_intent['kind']}",
             req_started=req_started,
             stt_to_aihub_ms=stt_to_aihub_ms,
         )
@@ -1856,7 +2289,11 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
         camera_actions_ms = _to_ms(time.monotonic() - actions_started)
         used_brain = "local"
         egress = "none"
-        assistant_text = cam_result or "Automatisk följning avaktiverad."
+        _follow_ctx = _build_pool_context(req.conversation_id)  # T015
+        if camera_intent == "camera_follow_start":
+            assistant_text = response_pool.pick("follow_start", _follow_ctx)
+        else:
+            assistant_text = response_pool.pick("follow_stop", _follow_ctx)
         db.insert_turn(req.conversation_id, "user", user_text, req.source, used_brain=used_brain)
         db.insert_turn(
             req.conversation_id,
@@ -1913,18 +2350,19 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
     if camera_intent in {"spotify_play", "spotify_pause", "spotify_next", "spotify_prev", "spotify_status"}:
         actions_started = time.monotonic()
         _ha_cfg = load_ha_config()
+        _spot_ctx = _build_pool_context(req.conversation_id)  # T014
         if camera_intent == "spotify_play":
             ok, reason = play_spotify(_ha_cfg)
-            assistant_text = "Spelar musik." if ok else "Kunde inte starta Spotify."
+            assistant_text = response_pool.pick("spotify_play", _spot_ctx) if ok else response_pool.pick("error_generic", _spot_ctx)
         elif camera_intent == "spotify_pause":
             ok, reason = pause_spotify(_ha_cfg)
-            assistant_text = "Pausar musik." if ok else "Kunde inte pausa Spotify."
+            assistant_text = response_pool.pick("spotify_pause", _spot_ctx) if ok else response_pool.pick("error_generic", _spot_ctx)
         elif camera_intent == "spotify_next":
             ok, reason = next_track(_ha_cfg)
-            assistant_text = "Hoppar till nästa låt." if ok else "Kunde inte byta låt."
+            assistant_text = response_pool.pick("spotify_next", _spot_ctx) if ok else response_pool.pick("error_generic", _spot_ctx)
         elif camera_intent == "spotify_prev":
             ok, reason = prev_track(_ha_cfg)
-            assistant_text = "Spelar föregående låt." if ok else "Kunde inte gå tillbaka."
+            assistant_text = response_pool.pick("spotify_prev", _spot_ctx) if ok else response_pool.pick("error_generic", _spot_ctx)
         elif camera_intent == "spotify_status":
             track = get_current_track(_ha_cfg)
             assistant_text = f"Det spelas {track}." if track else "Ingenting spelas just nu."
@@ -2112,20 +2550,29 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
         if (
             PROCESSING_ACK_ENABLED
             and req.source == "audio"
-            and PROCESSING_ACK_TEXT
             and should_send_processing_ack(user_text)
         ):
+            _proc_ctx = _build_pool_context(req.conversation_id)  # T019
+            _proc_ack_text = response_pool.pick("processing_ack", _proc_ctx)
+            _proc_src = req.source
             threading.Thread(
                 target=lambda: speak_to_camera(
-                    PROCESSING_ACK_TEXT,
-                    req.source,
+                    _proc_ack_text,
+                    _proc_src,
                     event="processing_ack",
                 ),
                 daemon=True,
             ).start()
 
         codex_call_started = time.monotonic()
-        ok, codex_text, codex_meta = ask_codex(user_text, req.conversation_id, context)
+        _codex_pool_ctx = _build_pool_context(req.conversation_id)  # T030
+        _session_ctx = {
+            "identity_name": _codex_pool_ctx.identity_name,
+            "time_of_day": _codex_pool_ctx.time_of_day,
+            "recent_activity": None,
+            "companion_mode": _codex_pool_ctx.companion_mode,
+        }
+        ok, codex_text, codex_meta = ask_codex(user_text, req.conversation_id, context, session_ctx=_session_ctx)
         t_codex = time.monotonic() - t0
         codex_ms = float(codex_meta.get("elapsed_sec", 0.0) or 0.0) * 1000.0
         if codex_ms <= 0:
@@ -2145,10 +2592,8 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
         else:
             used_brain = "local"
             egress = "none"
-            assistant_text = (
-                "Codex är inte tillgänglig just nu. "
-                f"Detalj: {codex_text}"
-            )
+            _err_ctx = _build_pool_context(req.conversation_id)  # T020
+            assistant_text = response_pool.pick("error_generic", _err_ctx) + f" Detalj: {codex_text}"
     else:
         assistant_text = "Jag kör lokalt läge."
 
@@ -2206,15 +2651,104 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
         _result = search_spotify(_spotify_query)
         if _result:
             _uri, _title = _result
-            _play_ok, _ = play_spotify_uri(_ha_cfg, _uri)
-            _replacement = f"Spelar {_title}." if _play_ok else f"Hittade {_title} men kunde inte starta uppspelning."
+            if is_liked_songs_uri(_uri):
+                _play_ok, _reason = play_liked_songs()
+                _replacement = "Spelar dina gillade låtar." if _play_ok else f"Kunde inte spela gillade låtar: {_reason}."
+            else:
+                _play_ok, _ = play_spotify_uri(_ha_cfg, _uri)
+                _replacement = f"Spelar {_title}." if _play_ok else f"Hittade {_title} men kunde inte starta uppspelning."
         else:
-            _replacement = f"Hittade inget för '{_spotify_query}'."
+            # Fallback: check the user's own playlists
+            _playlist = find_user_playlist(_spotify_query)
+            if _playlist:
+                _uri, _title = _playlist
+                _play_ok, _ = play_spotify_uri(_ha_cfg, _uri)
+                _replacement = f"Spelar {_title}." if _play_ok else f"Hittade {_title} men kunde inte starta uppspelning."
+            else:
+                _replacement = f"Hittade inget för '{_spotify_query}'."
         assistant_text = re.sub(
             r"\[SPOTIFY_SEARCH:[^\]]+\]", _replacement, assistant_text, flags=re.IGNORECASE
         ).strip()
         executed_actions.append("spotify_search")
         log.info("Tool SPOTIFY_SEARCH query=%r result=%r", _spotify_query, _result)
+
+    # LIGHTS: [LIGHTS:on/off/dim:N/warm/cool/neutral/color:NAME]
+    for _lights_match in re.finditer(r"\[LIGHTS:([^\]]+)\]", assistant_text, re.IGNORECASE):
+        _lights_arg = _lights_match.group(1).strip().lower()
+        _ha_cfg = load_ha_config()
+        if _lights_arg == "off":
+            control_lights(_ha_cfg, "off")
+        elif _lights_arg == "on":
+            control_lights(_ha_cfg, "on")
+        elif _lights_arg.startswith("dim:"):
+            try:
+                _pct = max(1, min(100, int(_lights_arg.split(":")[1])))
+                control_lights(_ha_cfg, "on", brightness_pct=_pct)
+            except ValueError:
+                pass
+        elif _lights_arg == "warm":
+            control_lights(_ha_cfg, "on", color_temp_kelvin=2700)
+        elif _lights_arg == "cool":
+            control_lights(_ha_cfg, "on", color_temp_kelvin=5000)
+        elif _lights_arg == "neutral":
+            control_lights(_ha_cfg, "on", color_temp_kelvin=3500)
+        elif _lights_arg.startswith("color:"):
+            _color_name = _lights_arg.split(":", 1)[1]
+            _color_map = {
+                "röd": (255, 0, 0), "blå": (0, 0, 255), "grön": (0, 200, 0),
+                "lila": (128, 0, 200), "orange": (255, 100, 0), "rosa": (255, 20, 130),
+                "gul": (255, 220, 0), "turkos": (0, 220, 200),
+            }
+            if _color_name in _color_map:
+                control_lights(_ha_cfg, "on", rgb_color=_color_map[_color_name])
+        executed_actions.append(f"lights:{_lights_arg}")
+        log.info("Tool LIGHTS:%s", _lights_arg)
+
+    # AIR: [AIR:on/off/sleep/turbo/auto]
+    for _air_match in re.finditer(r"\[AIR:(\w+)\]", assistant_text, re.IGNORECASE):
+        _air_cmd = _air_match.group(1).strip().lower()
+        _ha_cfg = load_ha_config()
+        control_air_purifier(_ha_cfg, _air_cmd)
+        executed_actions.append(f"air:{_air_cmd}")
+        log.info("Tool AIR:%s", _air_cmd)
+
+    # HA_QUERY: [HA_QUERY:entity_id] — replace tag with live sensor value
+    for _haq_match in re.finditer(r"\[HA_QUERY:([^\]]+)\]", assistant_text, re.IGNORECASE):
+        _entity = _haq_match.group(1).strip()
+        _ha_cfg = load_ha_config()
+        _val, _ = get_ha_state(_ha_cfg, _entity)
+        _unit_map = {
+            "sensor.sovrum_temperature": "°C",
+            "sensor.sovrum_humidity": "%",
+            "sensor.sovrum_pm2_5": "µg/m³",
+            "sensor.sovrum_water_level": "%",
+        }
+        _unit = _unit_map.get(_entity, "")
+        _replacement = f"{_val} {_unit}".strip() if _val else "okänt"
+        assistant_text = assistant_text.replace(_haq_match.group(0), _replacement)
+        executed_actions.append(f"ha_query:{_entity}")
+        log.info("Tool HA_QUERY:%s -> %s", _entity, _val)
+
+    # SPOTIFY simple controls: [SPOTIFY:pause/next/prev]
+    for _sp_match in re.finditer(r"\[SPOTIFY:(\w+)\]", assistant_text, re.IGNORECASE):
+        _sp_cmd = _sp_match.group(1).strip().lower()
+        _ha_cfg = load_ha_config()
+        if _sp_cmd == "pause":
+            pause_spotify(_ha_cfg)
+        elif _sp_cmd == "next":
+            next_track(_ha_cfg)
+        elif _sp_cmd == "prev":
+            prev_track(_ha_cfg)
+        executed_actions.append(f"spotify:{_sp_cmd}")
+        log.info("Tool SPOTIFY:%s", _sp_cmd)
+
+    # TV: [TV:pause/play/stop/mute/volume:up|down|N/app:NAME]
+    for _tv_match in re.finditer(r"\[TV:([^\]]+)\]", assistant_text, re.IGNORECASE):
+        _tv_cmd = _tv_match.group(1).strip().lower()
+        _ha_cfg = load_ha_config()
+        _tv_ok, _tv_reason = control_tv(_ha_cfg, _tv_cmd)
+        executed_actions.append(f"tv:{_tv_cmd}:{_tv_reason}")
+        log.info("Tool TV:%s ok=%s reason=%s", _tv_cmd, _tv_ok, _tv_reason)
 
     # CAMERA_LOOK: [CAMERA_LOOK] — snapshot + VLM, then second Codex call
     if re.search(r"\[CAMERA_LOOK\]", assistant_text, re.IGNORECASE):
@@ -2232,7 +2766,11 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
 
     # Strip all tool tags from the text before TTS
     assistant_text = re.sub(
-        r"\[(?:PTZ|ZOOM|FOLLOW):\w+\]|\[CAMERA_LOOK\]|\[CAMERA_RESET\]|\[SPOTIFY_SEARCH:[^\]]+\]",
+        r"\[(?:PTZ|ZOOM|FOLLOW):\w+\]"
+        r"|\[CAMERA_LOOK\]|\[CAMERA_RESET\]"
+        r"|\[SPOTIFY_SEARCH:[^\]]+\]|\[SPOTIFY:\w+\]"
+        r"|\[LIGHTS:[^\]]+\]|\[AIR:\w+\]|\[HA_QUERY:[^\]]+\]"
+        r"|\[TV:[^\]]+\]",
         "",
         assistant_text,
         flags=re.IGNORECASE,

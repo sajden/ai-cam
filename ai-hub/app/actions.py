@@ -150,6 +150,115 @@ def execute_route_actions(route_id: str, context: dict[str, Any]) -> tuple[list[
     return executed, skipped
 
 
+def get_ha_state(cfg: HAConfig, entity_id: str) -> tuple[str | None, str]:
+    """Return (state_value, reason). state_value is None on error."""
+    if not cfg.token:
+        return None, "missing_ha_token"
+    url = f"{cfg.base_url}/api/states/{entity_id}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {cfg.token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            return data.get("state"), "ok"
+    except Exception as exc:
+        return None, f"error:{type(exc).__name__}"
+
+
+def control_air_purifier(cfg: HAConfig, command: str) -> tuple[bool, str]:
+    """Control Philips air purifier fan. command: on|off|auto|sleep|turbo|speed_1|speed_2|speed_3"""
+    entity = os.getenv("AIHUB_AIR_PURIFIER_ENTITY", "fan.sovrum")
+    if command == "off":
+        return _ha_call(cfg, "fan.turn_off", {"entity_id": entity})
+    if command == "on":
+        return _ha_call(cfg, "fan.turn_on", {"entity_id": entity})
+    preset_map = {"auto": "auto", "sleep": "sleep", "turbo": "turbo",
+                  "speed_1": "speed_1", "speed_2": "speed_2", "speed_3": "speed_3"}
+    if command in preset_map:
+        return _ha_call(cfg, "fan.set_preset_mode", {"entity_id": entity, "preset_mode": preset_map[command]})
+    return False, f"unknown_command:{command}"
+
+
+_TV_APP_IDS: dict[str, str] = {
+    "youtube": "233637DE",
+    "netflix": "CA5E8412",
+    "hbo": "HBOMax",
+    "hbomax": "HBOMax",
+    "max": "HBOMax",
+    "spotify": "CC32E753",
+    "svtplay": "009B4F9A",
+    "svt": "009B4F9A",
+    "prime": "17608CFB",
+    "primevideo": "17608CFB",
+    "plex": "9AC194DC",
+    "disney": "C3DE6BC2",
+    "disneyplus": "C3DE6BC2",
+}
+
+
+def control_tv(cfg: HAConfig, command: str) -> tuple[bool, str]:
+    """Control Chromecast via HA. command: play|pause|stop|mute|volume:up|volume:down|volume:N|app:NAME"""
+    entity = os.getenv("AIHUB_TV_ENTITY", "").strip()
+    if not entity:
+        return False, "no_tv_entity_configured"
+    if command == "pause":
+        return _ha_call(cfg, "media_player.media_pause", {"entity_id": entity})
+    if command == "play":
+        return _ha_call(cfg, "media_player.media_play", {"entity_id": entity})
+    if command in ("stop", "off"):
+        return _ha_call(cfg, "media_player.turn_off", {"entity_id": entity})
+    if command == "mute":
+        return _ha_call(cfg, "media_player.volume_mute", {"entity_id": entity, "is_volume_muted": True})
+    if command == "unmute":
+        return _ha_call(cfg, "media_player.volume_mute", {"entity_id": entity, "is_volume_muted": False})
+    if command.startswith("volume:"):
+        vol_arg = command.split(":", 1)[1].strip()
+        if vol_arg == "up":
+            return _ha_call(cfg, "media_player.volume_up", {"entity_id": entity})
+        if vol_arg == "down":
+            return _ha_call(cfg, "media_player.volume_down", {"entity_id": entity})
+        try:
+            level = max(0, min(100, int(vol_arg)))
+            return _ha_call(cfg, "media_player.volume_set", {"entity_id": entity, "volume_level": level / 100})
+        except ValueError:
+            return False, f"invalid_volume:{vol_arg}"
+    if command.startswith("app:"):
+        app_name = command.split(":", 1)[1].strip().lower()
+        app_id = _TV_APP_IDS.get(app_name)
+        if not app_id:
+            return False, f"unknown_app:{app_name}"
+        return _ha_call(
+            cfg,
+            "media_player.play_media",
+            {
+                "entity_id": entity,
+                "media_content_type": "cast",
+                "media_content_id": json.dumps({"app_id": app_id}),
+            },
+        )
+    return False, f"unknown_tv_command:{command}"
+
+
+def control_lights(cfg: HAConfig, command: str, **kwargs: Any) -> tuple[bool, str]:
+    """Turn lights on/off via HA REST API. Entities read from AIHUB_LIGHT_ENTITIES."""
+    raw = os.getenv("AIHUB_LIGHT_ENTITIES", "").strip()
+    entities = [e.strip() for e in raw.split(",") if e.strip()]
+    if not entities:
+        return False, "no_entities_configured"
+    if command == "off":
+        return _ha_call(cfg, "light.turn_off", {"entity_id": entities})
+    payload: dict[str, Any] = {"entity_id": entities}
+    if "brightness_pct" in kwargs:
+        payload["brightness_pct"] = int(kwargs["brightness_pct"])
+    if "color_temp_kelvin" in kwargs:
+        payload["color_temp_kelvin"] = int(kwargs["color_temp_kelvin"])
+    if "rgb_color" in kwargs:
+        payload["rgb_color"] = list(kwargs["rgb_color"])
+    return _ha_call(cfg, "light.turn_on", payload)
+
+
 def play_spotify(cfg: HAConfig) -> tuple[bool, str]:
     if not cfg.spotify_entity_id:
         return False, "not_configured"

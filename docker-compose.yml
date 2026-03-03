@@ -115,7 +115,6 @@ services:
       TZ: ${TZ:-Europe/Stockholm}
     volumes:
       - ./data/homeassistant:/config
-      - /etc/localtime:/etc/localtime:ro
     extra_hosts:
       # Makes `host.docker.internal` work even on hosts where Docker doesn't add it automatically.
       # We use this when Home Assistant needs to reach something running on the Windows host
@@ -126,6 +125,29 @@ services:
       - "127.0.0.1:8123:8123"
       # Publish on Tailscale interface for phone access.
       - "${UI_BIND_ADDR}:8123:8123"
+    networks:
+      - ai_net
+
+  # Zigbee2MQTT = bridges Zigbee devices (lights, sensors) to MQTT.
+  # Talks to the Sonoff Zigbee 3.0 dongle via /dev/ttyUSB0 (attached via usbipd-win).
+  # Home Assistant then picks up devices automatically via MQTT discovery.
+  # Frontend UI on port 8099 — use it to permit join and pair new devices.
+  zigbee2mqtt:
+    image: koenkk/zigbee2mqtt:latest
+    container_name: ai-cam-zigbee2mqtt
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+    volumes:
+      - ./data/zigbee2mqtt:/app/data
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    privileged: true
+    ports:
+      - "127.0.0.1:8099:8099"
+      - "${UI_BIND_ADDR}:8099:8099"
     networks:
       - ai_net
 
@@ -178,8 +200,10 @@ services:
       AIHUB_SNAPSHOT_STREAM: ${AIHUB_SNAPSHOT_STREAM:-reolink_e1pro_main}
     volumes:
       - ./data/aihub:/data
-    expose:
-      - "8080"
+    ports:
+      # OAuth callback must be reachable from the browser on the host.
+      # Internal Docker traffic still uses the container name (http://aihub:8080).
+      - "127.0.0.1:8080:8080"
     depends_on:
       - codex-gateway
       - camera-voice-bridge
@@ -219,8 +243,9 @@ services:
       # Only needed for backend=openai
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
-      # Persist Codex OAuth/device-auth session so login survives recreate/restart.
-      - ./data/codex-auth:/root/.codex
+      # Named volume avoids WSL2 stale-dentry issue with bind mounts.
+      # Login once with: docker exec -it ai-cam-codex-gateway codex login --device-auth
+      - codex_auth:/root/.codex
     expose:
       - "8090"
     networks:
@@ -400,8 +425,13 @@ services:
     networks:
       - ai_net
 
+
 networks:
   # Named network so helper scripts can reference it reliably.
   ai_net:
     name: ai-cam-net
     driver: bridge
+
+volumes:
+  # Codex CLI auth persisted in Docker-managed volume to avoid WSL2 bind-mount issues.
+  codex_auth:

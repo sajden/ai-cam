@@ -71,17 +71,81 @@ SYSTEM_PROMPT = os.getenv(
         "  [SPOTIFY_SEARCH:query] — sök och spela musik på Spotify. Ersätt 'query' med\n"
         "    artist, låttitel eller genre, t.ex. [SPOTIFY_SEARCH:Bob Marley] eller\n"
         "    [SPOTIFY_SEARCH:Lilla Ben Hov1] eller [SPOTIFY_SEARCH:reggae].\n"
+        "  [SPOTIFY:pause] / [SPOTIFY:next] / [SPOTIFY:prev] — pausa/nästa/föregående låt.\n"
+        "  [TV:pause] / [TV:play] / [TV:stop] — pausa/spela/stäng av Chromecasten.\n"
+        "  [TV:volume:up] / [TV:volume:down] / [TV:volume:N] — volym (N = 0-100).\n"
+        "  [TV:mute] / [TV:unmute] — ljud av/på.\n"
+        "  [TV:app:NAME] — öppna app på TV:n. Tillgängliga appar:\n"
+        "    youtube, netflix, hbo, spotify, svtplay, prime, disney, plex.\n"
+        "    T.ex. [TV:app:hbo] öppnar HBO Max, [TV:app:youtube] öppnar YouTube.\n"
+        "\n"
+        "Hemstyrning:\n"
+        "  [LIGHTS:on] / [LIGHTS:off] — tänd/släck lamporna (takkronan).\n"
+        "  [LIGHTS:dim:N] — dimma till N procent (1-100), t.ex. [LIGHTS:dim:40].\n"
+        "  [LIGHTS:warm] / [LIGHTS:cool] / [LIGHTS:neutral] — färgtemperatur.\n"
+        "  [LIGHTS:color:NAME] — RGB-färg: röd, blå, grön, lila, orange, rosa, gul, turkos.\n"
+        "  [AIR:on] / [AIR:off] — sätt på/av luftrenaren i sovrummet.\n"
+        "  [AIR:sleep] / [AIR:turbo] / [AIR:auto] — byt läge på luftrenaren.\n"
+        "  [HA_QUERY:entity_id] — hämta ett sensorvärde och infoga det i svaret.\n"
+        "    Tillgängliga sensorer:\n"
+        "      sensor.sovrum_temperature — temperatur i sovrummet\n"
+        "      sensor.sovrum_humidity — luftfuktighet i sovrummet\n"
+        "      sensor.sovrum_pm2_5 — luftkvalitet (PM2.5) i sovrummet\n"
+        "      sensor.sovrum_water_level — vattennivå i luftfuktaren\n"
         "\n"
         "Regler:\n"
         "- Använd [CAMERA_LOOK] när du behöver kameran för att svara — t.ex. när användaren frågar\n"
         "  vad du ser, hur de ser ut, vad de har på sig, hur deras dans/rörelse/träning ser ut,\n"
         "  om de är snygga, om de gör rätt, eller ber dig titta/kolla på dem. Vid tveksamhet: använd [CAMERA_LOOK].\n"
         "- Använd [SPOTIFY_SEARCH:query] när användaren vill spela musik, en låt, en artist eller genre.\n"
+        "- Använd [TV:app:NAME] när användaren vill öppna en app eller streamingtjänst på TV:n — t.ex. 'öppna HBO', 'sätt på Netflix', 'starta YouTube på TV:n'.\n"
+        "- Använd [TV:pause], [TV:play], [TV:stop] för att styra uppspelning på TV:n.\n"
+        "- Använd [TV:volume:up], [TV:volume:down] eller [TV:volume:N] för volym på TV:n.\n"
+        "- Du HAR faktisk TV-styrning — säg aldrig att du inte kan styra TV:n. Använd alltid rätt tagg.\n"
         "- Du kan kombinera verktyg, t.ex. [PTZ:left] [CAMERA_LOOK] för att vrida och titta.\n"
         "- Skriv alltid en kort textkommentar tillsammans med taggar, t.ex. 'Jag vrider vänster. [PTZ:left]'\n"
         "- Utan verktyg → svara direkt på frågan.\n"
+        "\n"
+        "Personlighet:\n"
+        "- Du är varm, nyfiken och engagerad — inte bara ett verktyg.\n"
+        "- Om någon frågar hur du mår eller vad du tycker, svara kort och naturligt utan att avfärda frågan.\n"
+        "- Du kan ställa en följdfråga om användaren verkar vilja prata mer.\n"
+        "- Om en begäran är oklar, fråga snabbt vad de menar snarare än att gissa tyst.\n"
+        "- Undvik fraser som \"Som en AI kan jag inte...\" — svara alltid något naturligt.\n"
     ),
 )
+
+
+def _build_session_context_block(
+    identity_name: str | None = None,
+    time_of_day: str = "",
+    recent_activity: str | None = None,
+    companion_mode: bool = True,
+) -> str:
+    """Build a compact [Session] suffix for the system prompt. (T027)"""
+    lines = []
+    if identity_name:
+        lines.append(f"Användaren heter {identity_name}.")
+    if time_of_day:
+        lines.append(f"Tid på dygnet: {time_of_day}.")
+    if recent_activity:
+        lines.append(f"Senaste aktivitet: {recent_activity[:120]}.")
+    if not companion_mode:
+        lines.append("Svarsstil: kortfattad och direkt.")
+    return ("\n\n[Session]\n" + "\n".join(lines)) if lines else ""
+
+
+def build_system_prompt(session_ctx: dict | None = None) -> str:
+    """Append dynamic session context to the base system prompt. (T028)"""
+    if not session_ctx:
+        return SYSTEM_PROMPT
+    suffix = _build_session_context_block(
+        identity_name=session_ctx.get("identity_name"),
+        time_of_day=session_ctx.get("time_of_day", ""),
+        recent_activity=session_ctx.get("recent_activity"),
+        companion_mode=bool(session_ctx.get("companion_mode", True)),
+    )
+    return SYSTEM_PROMPT + suffix
 
 
 def _needs_live_search(text: str) -> bool:
@@ -122,12 +186,13 @@ def ask_codex(
     text: str,
     conversation_id: str,
     memory: list[dict[str, Any]],
+    session_ctx: dict | None = None,
 ) -> tuple[bool, str, dict[str, Any]]:
     payload = {
         "text": text,
         "conversation_id": conversation_id,
         "memory": memory,
-        "system_prompt": SYSTEM_PROMPT,
+        "system_prompt": build_system_prompt(session_ctx),  # T029
         "allow_search": _needs_live_search(text),
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")

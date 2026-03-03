@@ -168,6 +168,13 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_face_embeddings_person
                 ON face_embeddings(person_id, id DESC);
 
+            CREATE TABLE IF NOT EXISTS response_pool_usage (
+                pool_name   TEXT NOT NULL,
+                variant_key TEXT NOT NULL,
+                used_at     TEXT NOT NULL,
+                PRIMARY KEY (pool_name, variant_key)
+            );
+
             CREATE TABLE IF NOT EXISTS route_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 route_id TEXT NOT NULL,
@@ -1356,3 +1363,76 @@ def db_to_bool(value: str | None) -> bool:
 
 def dump_json(data: dict | list) -> str:
     return json.dumps(data, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# Response pool LRU helpers (T002, T003)
+# ---------------------------------------------------------------------------
+
+def load_pool_usage() -> list[dict]:
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT pool_name, variant_key, used_at FROM response_pool_usage ORDER BY used_at ASC"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_pool_usage(pool_name: str, variant_key: str) -> None:
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO response_pool_usage (pool_name, variant_key, used_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(pool_name, variant_key) DO UPDATE SET used_at=excluded.used_at
+            """,
+            (pool_name, variant_key, now_iso()),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-identity companion preference helpers (T004)
+# ---------------------------------------------------------------------------
+
+def get_companion_pref(person_id: int) -> str:
+    key = f"companion_pref_{person_id}"
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM mode_state WHERE key = ? LIMIT 1",
+            (key,),
+        ).fetchone()
+    if not row:
+        return "full"
+    return str(row["value"]).strip() or "full"
+
+
+def set_companion_pref(person_id: int, pref: str) -> None:
+    key = f"companion_pref_{person_id}"
+    set_mode_state({key: pref})
+
+
+# ---------------------------------------------------------------------------
+# Last interaction timestamp helper (T005)
+# ---------------------------------------------------------------------------
+
+def get_last_interaction_at(person_id: int | None) -> datetime | None:
+    if person_id is None:
+        with connect() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM conversation_turns ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+    else:
+        with connect() as conn:
+            row = conn.execute(
+                """
+                SELECT ct.created_at
+                FROM conversation_turns ct
+                JOIN conversation_identity ci ON ci.conversation_id = ct.conversation_id
+                WHERE ci.person_id = ?
+                ORDER BY ct.id DESC
+                LIMIT 1
+                """,
+                (person_id,),
+            ).fetchone()
+    if not row:
+        return None
+    return _parse_ts(str(row["created_at"]))

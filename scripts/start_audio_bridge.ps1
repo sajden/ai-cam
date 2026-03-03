@@ -85,4 +85,11 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Write-Warning "[audio-bridge] ffmpeg not found in PATH. Audio conversion will fail until ffmpeg is installed."
 }
 
+# Keep Bluetooth speaker awake by playing silent audio every 4 minutes
+$keepaliveScript = Join-Path $PSScriptRoot "keepalive_speaker.py"
+if (Test-Path $keepaliveScript) {
+    Start-Process $pyCmd -ArgumentList ($pyArgs + @($keepaliveScript)) -WindowStyle Hidden
+    Write-Host "[audio-bridge] Speaker keepalive started."
+}
+
 & $pyCmd @pyArgs $BridgeScriptPath
