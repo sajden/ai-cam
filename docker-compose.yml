@@ -44,59 +44,30 @@ services:
     networks:
       - ai_net
 
-  # Frigate = local NVR (Network Video Recorder).
-  # NVR = a "camera recorder" app that ingests camera streams and saves events/clips locally.
+  # go2rtc = lightweight RTSP proxy / WebRTC gateway.
+  # Replaces the go2rtc bundled inside Frigate — same streams, less overhead.
   #
-  # It will:
-  # - Ingest RTSP from your camera (RTSP = camera video stream protocol on LAN)
-  # - Run detection (CPU for MVP; later GPU/Coral)
-  # - Create alerts/detections and keep those "event" segments
-  # - Provide a UI + live view via WebRTC (low-latency live video in browser)
-  frigate:
-    image: ghcr.io/blakeblackshear/frigate:stable
-    container_name: ai-cam-frigate
+  # Provides:
+  # - RTSP re-publishing on port 8554 (camera-listener, ai-hub video feed)
+  # - WebRTC live view on port 1984 (Home Assistant, browser)
+  # - HTTP API on port 1984 (ai-hub snapshot fetch, audio push)
+  #
+  # Copy data/go2rtc/config.yaml.example → data/go2rtc/config.yaml and fill in camera URL.
+  go2rtc:
+    image: alexxit/go2rtc
+    container_name: ai-cam-go2rtc
     restart: unless-stopped
-    depends_on:
-      - mosquitto
-    shm_size: "512mb"
-    env_file:
-      - .env
     environment:
       TZ: ${TZ:-Europe/Stockholm}
     volumes:
-      # Rendered config file. We render into ./data/config/ so secrets never live in git.
-      - ./data/config/frigate.yml:/config/config.yml:ro
-      - ./data/frigate:/data
-      # Media outputs (host paths)
-      - ./data/recordings:/media/frigate/recordings
-      - ./data/clips:/media/frigate/clips
-      - ./data/logs/frigate:/var/log/frigate
-      - ./data/models:/config/model_cache
-    # UI ports (restrict these on the Windows firewall to Tailscale only).
-    # Tip: set UI_BIND_ADDR to your Windows host's Tailscale IP (100.x.y.z) to avoid LAN exposure.
+      # Copy go2rtc/config.yaml.example → go2rtc/config.yaml and fill in camera credentials.
+      - ./go2rtc:/config
     ports:
-      # Publish on localhost so browser mic/camera features work without HTTPS.
-      - "127.0.0.1:5000:5000"
-      # Publish on Tailscale interface for phone access.
-      - "${UI_BIND_ADDR}:5000:5000"
-      # WebRTC for live view (Frigate/go2rtc)
-      - "127.0.0.1:8555:8555/tcp"
-      - "127.0.0.1:8555:8555/udp"
-      - "${UI_BIND_ADDR}:8555:8555/tcp"
-      - "${UI_BIND_ADDR}:8555:8555/udp"
-      # go2rtc admin UI (keep local)
+      # RTSP proxy port — published to host for camera-listener and ai-hub video loop.
+      - "127.0.0.1:8554:8554"
+      # WebRTC / HTTP API — keep local, access via Tailscale if needed.
       - "127.0.0.1:1984:1984"
-    # Optional hardware acceleration (uncomment what you actually have):
-    # devices:
-    #   - /dev/dri:/dev/dri                 # Intel/AMD iGPU (VAAPI)
-    #   - /dev/bus/usb:/dev/bus/usb         # Coral USB
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
+      - "${UI_BIND_ADDR}:1984:1984"
     networks:
       - ai_net
 
@@ -196,8 +167,24 @@ services:
       AIHUB_OLLAMA_CORRECTOR_TIMEOUT_SEC: ${AIHUB_OLLAMA_CORRECTOR_TIMEOUT_SEC:-5}
       AIHUB_OLLAMA_TIMEOUT_SEC: ${AIHUB_OLLAMA_TIMEOUT_SEC:-30}
       # Snapshot
-      AIHUB_GO2RTC_BASE_URL: ${AIHUB_GO2RTC_BASE_URL:-http://frigate:1984}
+      AIHUB_GO2RTC_BASE_URL: ${AIHUB_GO2RTC_BASE_URL:-http://go2rtc:1984}
       AIHUB_SNAPSHOT_STREAM: ${AIHUB_SNAPSHOT_STREAM:-reolink_e1pro_main}
+      # Face recognition + arrival flow
+      AIHUB_FACE_RECOGNITION_URL: ${AIHUB_FACE_RECOGNITION_URL:-http://face-recognition:8082}
+      AIHUB_FACE_RECOGNITION_THRESHOLD: ${AIHUB_FACE_RECOGNITION_THRESHOLD:-0.55}
+      AIHUB_ARRIVAL_COOLDOWN_SEC: ${AIHUB_ARRIVAL_COOLDOWN_SEC:-7200}
+      AIHUB_UNKNOWN_PERSON_COOLDOWN_SEC: ${AIHUB_UNKNOWN_PERSON_COOLDOWN_SEC:-86400}
+      # PTZ gestures
+      AIHUB_PTZ_GESTURES_ENABLED: ${AIHUB_PTZ_GESTURES_ENABLED:-0}
+      AIHUB_PTZ_NOD_SPEED: ${AIHUB_PTZ_NOD_SPEED:-10}
+      AIHUB_PTZ_SHAKE_SPEED: ${AIHUB_PTZ_SHAKE_SPEED:-10}
+      AIHUB_PTZ_NOD_DURATION_SEC: ${AIHUB_PTZ_NOD_DURATION_SEC:-0.35}
+      AIHUB_PTZ_SHAKE_DURATION_SEC: ${AIHUB_PTZ_SHAKE_DURATION_SEC:-0.3}
+      # Memory extraction
+      AIHUB_MEMORY_EXTRACTION_ENABLED: ${AIHUB_MEMORY_EXTRACTION_ENABLED:-0}
+      # Proactive companion
+      AIHUB_PROACTIVE_ENABLED: ${AIHUB_PROACTIVE_ENABLED:-0}
+      AIHUB_MORNING_GREETING_TIME: ${AIHUB_MORNING_GREETING_TIME:-07:00}
     volumes:
       - ./data/aihub:/data
     ports:
@@ -207,6 +194,7 @@ services:
     depends_on:
       - codex-gateway
       - camera-voice-bridge
+      - face-recognition
     networks:
       - ai_net
 
@@ -296,7 +284,7 @@ services:
       - .env
     environment:
       CAMERA_LISTENER_ENABLED: ${CAMERA_LISTENER_ENABLED:-1}
-      CAMERA_LISTENER_RTSP_URL: ${CAMERA_LISTENER_RTSP_URL:-rtsp://frigate:8554/reolink_e1pro_main}
+      CAMERA_LISTENER_RTSP_URL: ${CAMERA_LISTENER_RTSP_URL:-rtsp://go2rtc:8554/reolink_e1pro_main}
       CAMERA_LISTENER_DEVICE_ID: ${CAMERA_LISTENER_DEVICE_ID:-reolink_mic}
       CAMERA_LISTENER_AIHUB_URL: ${CAMERA_LISTENER_AIHUB_URL:-http://aihub:8080}
       CAMERA_LISTENER_AIHUB_TOKEN: ${CAMERA_LISTENER_AIHUB_TOKEN:-}
@@ -369,7 +357,35 @@ services:
       - ./data/camera-listener:/data
     depends_on:
       - aihub
-      - frigate
+      - go2rtc
+    networks:
+      - ai_net
+
+  # face-recognition = local InsightFace service for household member identity.
+  # Runs InsightFace buffalo_l on NVIDIA GPU (RTX 4070) for fast face embedding.
+  # Internal-only — ai-hub calls it via HTTP on ai_net. No host-published port.
+  face-recognition:
+    build:
+      context: ./face-recognition
+    container_name: ai-cam-face-recognition
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      FACE_RECOGNITION_API_KEY: ${FACE_RECOGNITION_API_KEY:-}
+      FACE_RECOGNITION_THRESHOLD: ${FACE_RECOGNITION_THRESHOLD:-0.55}
+    volumes:
+      # Named volume: persists InsightFace model downloads + enrolled embeddings across restarts.
+      - insightface_models:/root/.insightface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    expose:
+      - "8082"
     networks:
       - ai_net
 
@@ -435,3 +451,5 @@ networks:
 volumes:
   # Codex CLI auth persisted in Docker-managed volume to avoid WSL2 bind-mount issues.
   codex_auth:
+  # InsightFace model downloads + enrolled face embeddings (persisted across container rebuilds).
+  insightface_models:

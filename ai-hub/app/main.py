@@ -61,8 +61,9 @@ from .live_video import LiveVideoFeed
 from .ollama_client import ask_vision_model, classify_as_vision
 from .policy import evaluate_candidate_egress, should_use_codex
 from .rep_counter import SimpleVerticalRepCounter
-from .reolink_client import execute_camera_intent
+from .reolink_client import execute_camera_intent, get_shared_client as _get_reolink_client
 from .snapshot_client import fetch_snapshot
+from . import face_client
 
 
 
@@ -239,6 +240,27 @@ MINIMAL_MODE_ON_ACK_TEXT = os.getenv(
 MINIMAL_MODE_OFF_ACK_TEXT = os.getenv(
     "AIHUB_MINIMAL_MODE_OFF_ACK_TEXT", "Okej, jag svarar som vanligt igen."
 ).strip()
+
+# Face recognition + arrival flow (Phase B)
+FACE_RECOGNITION_URL = os.getenv("AIHUB_FACE_RECOGNITION_URL", "http://face-recognition:8082").strip()
+ARRIVAL_COOLDOWN_SEC = int(os.getenv("AIHUB_ARRIVAL_COOLDOWN_SEC", "7200"))
+UNKNOWN_PERSON_COOLDOWN_SEC = int(os.getenv("AIHUB_UNKNOWN_PERSON_COOLDOWN_SEC", "86400"))
+PTZ_GESTURES_ENABLED = os.getenv("AIHUB_PTZ_GESTURES_ENABLED", "0").strip() == "1"
+PTZ_NOD_SPEED = int(os.getenv("AIHUB_PTZ_NOD_SPEED", "10"))
+PTZ_SHAKE_SPEED = int(os.getenv("AIHUB_PTZ_SHAKE_SPEED", "10"))
+PTZ_NOD_DURATION_SEC = float(os.getenv("AIHUB_PTZ_NOD_DURATION_SEC", "0.35"))
+PTZ_SHAKE_DURATION_SEC = float(os.getenv("AIHUB_PTZ_SHAKE_DURATION_SEC", "0.3"))
+HA_URL = os.getenv("AIHUB_HA_BASE_URL", "http://homeassistant:8123").strip()
+HA_TOKEN = os.getenv("AIHUB_HA_TOKEN", "").strip()
+MEMORY_EXTRACTION_ENABLED = os.getenv("AIHUB_MEMORY_EXTRACTION_ENABLED", "0").strip() == "1"
+PROACTIVE_ENABLED = os.getenv("AIHUB_PROACTIVE_ENABLED", "0").strip() == "1"
+MORNING_GREETING_TIME = os.getenv("AIHUB_MORNING_GREETING_TIME", "07:00").strip()
+
+# Enrollment intent pattern (voice: "Det här är Sebastian")
+_ENROLL_INTENT = re.compile(
+    r"\b(det\s+h[äa]r\s+[äa]r|jag\s+heter|mitt\s+namn\s+[äa]r|jag\s+[äa]r)\s+(\w+)\b",
+    re.IGNORECASE,
+)
 
 # Minimal mode detection patterns (T031)
 _MINIMAL_MODE_ON = re.compile(
@@ -582,6 +604,18 @@ def _is_active_audio_conversation(conversation_id: str, mode: dict[str, Any]) ->
             conversation_id="",
             conversation_expires_at="",
         )
+        # T032: trigger memory extraction at conversation close
+        if MEMORY_EXTRACTION_ENABLED:
+            _closed_conv_id = current_conversation_id
+            _closed_person = db.get_mode_state().get("active_person_name", "").strip()
+            if _closed_person and _closed_conv_id:
+                import asyncio as _asyncio
+                from .memory_manager import extract_and_store_facts as _extract_facts
+
+                def _run_extraction() -> None:
+                    _asyncio.run(_extract_facts(_closed_conv_id, _closed_person))
+
+                threading.Thread(target=_run_extraction, daemon=True).start()
         return False, "conversation_expired"
     return True, "active"
 
@@ -1585,6 +1619,243 @@ def _start_vision_loop_once() -> None:
     log.info("Vision loop started (enabled=%s, tick=%.2fs)", VISION_LOOP_ENABLED, VISION_LOOP_TICK_SEC)
 
 
+# ---------------------------------------------------------------------------
+# Arrival flow helpers (T016, T017, T018, T019)
+# ---------------------------------------------------------------------------
+
+async def _fetch_ha_snapshot(snapshot_url: str) -> bytes:
+    """Fetch a JPEG snapshot from HA camera proxy. Returns empty bytes on error."""
+    import httpx as _httpx
+    if not snapshot_url:
+        return b""
+    headers: dict[str, str] = {}
+    if HA_TOKEN:
+        headers["Authorization"] = f"Bearer {HA_TOKEN}"
+    try:
+        async with _httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(snapshot_url, headers=headers, follow_redirects=True)
+            resp.raise_for_status()
+            return resp.content
+    except Exception as exc:
+        log.warning("Failed to fetch HA snapshot from %s: %s", snapshot_url, exc)
+        return b""
+
+
+def _time_greeting_sv() -> str:
+    """Return a time-appropriate Swedish greeting prefix."""
+    hour = datetime.now().hour
+    if 5 <= hour < 11:
+        return "God morgon"
+    elif 11 <= hour < 18:
+        return "Hej"
+    elif 18 <= hour < 23:
+        return "God kväll"
+    else:
+        return "Hej"
+
+
+async def _handle_person_arrived(
+    snapshot_bytes: bytes,
+    conversation_id: str,
+) -> dict[str, Any]:
+    """
+    Core arrival logic.
+
+    Returns dict with: identity, action, matched.
+    """
+    # Step 1 — face recognition
+    result = await face_client.async_recognize(snapshot_bytes)
+    matched: bool = result.get("matched", False)
+    name: str | None = result.get("name")
+
+    # Step 2 — presence check
+    if matched and name:
+        new_arrival = db.is_new_arrival(name, ARRIVAL_COOLDOWN_SEC)
+        db.upsert_presence(name)
+
+        if new_arrival:
+            # Known person — new arrival
+            greeting_prefix = _time_greeting_sv()
+            greeting = f"{greeting_prefix} {name}! Vad kul att se dig."
+            db.set_greeted(name)
+            db.set_mode_state({"active_person_name": name})
+            try:
+                db.bind_identity_to_conversation(
+                    conversation_id=conversation_id,
+                    athlete_name=name,
+                    confidence=float(result.get("confidence", 1.0)),
+                    source="face_recognition",
+                )
+            except Exception:
+                pass
+            # Greet + PTZ nod in parallel
+            threading.Thread(
+                target=lambda: speak_to_camera(greeting, "arrival", event="reply"),
+                daemon=True,
+            ).start()
+            if PTZ_GESTURES_ENABLED:
+                threading.Thread(target=_ptz_nod, daemon=True).start()
+            log.info("Arrival greeting for %s", name)
+            return {"identity": name, "action": "arrival_greeting", "matched": True}
+        else:
+            # Known person — already home, silent update
+            db.set_mode_state({"active_person_name": name})
+            log.info("Presence updated (already home): %s", name)
+            return {"identity": name, "action": "presence_updated", "matched": True}
+    else:
+        # Unknown person
+        last_unknown = db.get_last_unknown_face_at()
+        now_utc = datetime.now(timezone.utc)
+        elapsed = (
+            (now_utc - last_unknown).total_seconds()
+            if last_unknown else UNKNOWN_PERSON_COOLDOWN_SEC + 1
+        )
+        if elapsed >= UNKNOWN_PERSON_COOLDOWN_SEC:
+            db.set_last_unknown_face_at()
+            threading.Thread(
+                target=lambda: speak_to_camera(
+                    "Hej, jag känner inte igen dig — vem är du?",
+                    "arrival",
+                    event="reply",
+                ),
+                daemon=True,
+            ).start()
+            log.info("Unknown person detected, asked for identity")
+            return {"identity": None, "action": "asked_unknown", "matched": False}
+        else:
+            log.info("Unknown person cooldown active, staying silent")
+            return {"identity": None, "action": "silent_unknown", "matched": False}
+
+
+# ---------------------------------------------------------------------------
+# PTZ gesture helpers (T022–T025, Phase C)
+# ---------------------------------------------------------------------------
+
+def _ptz_nod() -> None:
+    """Camera nods (up then down). Non-blocking, exceptions logged."""
+    try:
+        rc = _get_reolink_client()
+        rc.ptz_burst("Up", PTZ_NOD_SPEED, PTZ_NOD_DURATION_SEC)
+        time.sleep(PTZ_NOD_DURATION_SEC + 0.1)
+        rc.ptz_burst("Down", PTZ_NOD_SPEED, PTZ_NOD_DURATION_SEC)
+    except Exception as exc:
+        log.warning("PTZ nod failed: %s", exc)
+
+
+def _ptz_shake() -> None:
+    """Camera shakes head (left then right). Non-blocking, exceptions logged."""
+    try:
+        rc = _get_reolink_client()
+        rc.ptz_burst("Left", PTZ_SHAKE_SPEED, PTZ_SHAKE_DURATION_SEC)
+        time.sleep(PTZ_SHAKE_DURATION_SEC + 0.1)
+        rc.ptz_burst("Right", PTZ_SHAKE_SPEED, PTZ_SHAKE_DURATION_SEC)
+    except Exception as exc:
+        log.warning("PTZ shake failed: %s", exc)
+
+
+def _ptz_thinking() -> None:
+    """Camera looks down (thinking). Non-blocking."""
+    try:
+        rc = _get_reolink_client()
+        rc.ptz_burst("Down", 6, 0.4)
+    except Exception as exc:
+        log.warning("PTZ thinking failed: %s", exc)
+
+
+def _detect_response_type(text: str) -> str:
+    """Scan Swedish text for affirmative/negative tone. Returns 'yes', 'no', or 'neutral'."""
+    lowered = text.lower()
+    affirmatives = ("ja", "absolut", "självklart", "visst", "precis", "stämmer", "givetvis", "naturligtvis", "helt rätt")
+    negatives = ("nej", "inte", "tyvärr", "dessvärre", "fel", "felaktigt", "aldrig", "knappast")
+    for word in affirmatives:
+        if word in lowered:
+            return "yes"
+    for word in negatives:
+        if f" {word}" in f" {lowered}" or lowered.startswith(word):
+            return "no"
+    return "neutral"
+
+
+_WORD_OF_DAY_FALLBACK = [
+    "serendipitet — oväntad lycka", "resiliens — förmåga att återhämta sig",
+    "altruism — osjälvisk omtanke", "empati — förmåga att förstå andras känslor",
+    "introspektion — självrannsakan", "eufori — intensiv glädje",
+    "apati — brist på känslor eller intresse", "nostalgi — längtan tillbaka",
+    "procrastination — att skjuta upp saker", "mindfulness — medveten närvaro",
+    "entusiasm — hängivet engagemang", "kuriosa — spännande fakta",
+    "paradox — skenbar motsägelse", "syntes — sammanslagning av idéer",
+    "innovation — ny lösning på gammalt problem", "intuition — känslobaserat vetande",
+    "kontext — sammanhang som ger mening", "ambivalens — motstridiga känslor",
+    "pragmatism — fokus på vad som fungerar", "synestesi — sammanblandning av sinnen",
+    "deja vu — känslan av att ha upplevt något förut", "epifani — plötslig insikt",
+    "lakonisk — kortfattad och kärnfull", "flegmatisk — lugn och obesvärad",
+    "melankoli — djup vemod", "hyperbel — överdrift för effekt",
+    "metafor — bildspråk", "ironi — avsedd kontrast mot det sagda",
+    "allegori — berättelse med dold mening", "eufemism — mildare ordval",
+]
+
+
+def _get_word_of_day() -> str:
+    """Return a word-of-day string. Tries Codex first, falls back to static list."""
+    try:
+        from .codex_client import ask_codex
+        ok, text, _ = ask_codex(
+            "Ge mig ett intressant svenskt eller engelskt ord med kort förklaring på svenska, max 20 ord. "
+            "Svara med bara: ORDET — förklaringen.",
+            "__word_of_day__",
+            [],
+        )
+        if ok and text and len(text) > 5:
+            return text.strip()
+    except Exception:
+        pass
+    import hashlib
+    day_key = datetime.now().strftime("%Y-%m-%d")
+    idx = int(hashlib.md5(day_key.encode()).hexdigest(), 16) % len(_WORD_OF_DAY_FALLBACK)
+    return _WORD_OF_DAY_FALLBACK[idx]
+
+
+def _schedule_morning_greeting() -> None:
+    """Schedule a threading.Timer for today's or tomorrow's morning greeting."""
+    if not PROACTIVE_ENABLED:
+        return
+    try:
+        hour, minute = (int(x) for x in MORNING_GREETING_TIME.split(":"))
+    except Exception:
+        hour, minute = 7, 0
+
+    now = datetime.now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target = target + timedelta(days=1)
+
+    delay_sec = (target - now).total_seconds()
+    log.info("Morning greeting scheduled in %.0fs at %s", delay_sec, target.strftime("%H:%M"))
+
+    def _fire() -> None:
+        try:
+            state = db.get_mode_state()
+            active_person = state.get("active_person_name", "").strip()
+            privacy = state.get("privacy_mode", "false")
+            if privacy == "true":
+                log.info("Skipping morning greeting: privacy mode")
+            else:
+                wod = _get_word_of_day()
+                greeting_parts = ["God morgon!"]
+                if active_person:
+                    greeting_parts = [f"God morgon {active_person}!"]
+                greeting_parts.append(f"Dagens ord är: {wod}")
+                speak_to_camera(" ".join(greeting_parts), "proactive", event="reply")
+        except Exception as exc:
+            log.warning("Morning greeting failed: %s", exc)
+        finally:
+            _schedule_morning_greeting()  # Reschedule for tomorrow
+
+    timer = threading.Timer(delay_sec, _fire)
+    timer.daemon = True
+    timer.start()
+
+
 @app.on_event("startup")
 def startup() -> None:
     db.init_db()
@@ -1593,6 +1864,7 @@ def startup() -> None:
         log.warning("Pillow not available; face embedding disabled")
     _start_live_video_once()
     _start_vision_loop_once()
+    _schedule_morning_greeting()
 
 
 @app.get("/v1/health", dependencies=[Depends(_require_auth)])
@@ -2170,6 +2442,40 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
             stt_to_aihub_ms=stt_to_aihub_ms,
         )
 
+    # Enrollment intent pre-flight: "Det här är Sebastian" / "Jag heter Emma" (T014)
+    _enroll_match = _ENROLL_INTENT.search(user_text)
+    if _enroll_match:
+        _enroll_name = _enroll_match.group(2).capitalize()
+        _enroll_msg = f"Ok, jag kommer komma ihåg {_enroll_name}!"
+        log.info("Enrollment intent: %s", _enroll_name)
+        import asyncio as _asyncio
+
+        async def _do_enroll_bg() -> None:
+            snapshot_url = f"{HA_URL}/api/camera_proxy/camera.reolink_e1pro"
+            _jpegs = await _fetch_ha_snapshot(snapshot_url)
+            if _jpegs:
+                await face_client.async_enroll(_enroll_name, _jpegs)
+            try:
+                db.remember_identity(athlete_name=_enroll_name, source="insightface_buffalo_l")
+            except Exception:
+                pass
+
+        threading.Thread(
+            target=lambda: _asyncio.run(_do_enroll_bg()),
+            daemon=True,
+        ).start()
+        return _reply_local_turn(
+            conversation_id=req.conversation_id,
+            source=req.source,
+            user_text=user_text,
+            assistant_text=_enroll_msg,
+            route_id="R_ENROLL",
+            intent="enrollment",
+            decision_reason="enrollment_intent",
+            req_started=req_started,
+            stt_to_aihub_ms=stt_to_aihub_ms,
+        )
+
     # Minimal mode pre-flight: detect verbal mode switch before any intent routing (T034)
     _mode_switch = _detect_minimal_mode_switch(user_text)
     if _mode_switch is not None:
@@ -2564,10 +2870,17 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
                 daemon=True,
             ).start()
 
+        # PTZ thinking pose while Codex processes (T028)
+        if PTZ_GESTURES_ENABLED:
+            threading.Thread(target=_ptz_thinking, daemon=True).start()
+
         codex_call_started = time.monotonic()
         _codex_pool_ctx = _build_pool_context(req.conversation_id)  # T030
+        # T034: enrich session_ctx with active_person_name so memory facts are injected
+        _active_person = db.get_mode_state().get("active_person_name", "").strip() or None
         _session_ctx = {
-            "identity_name": _codex_pool_ctx.identity_name,
+            "identity_name": _codex_pool_ctx.identity_name or _active_person,
+            "person_name": _active_person,
             "time_of_day": _codex_pool_ctx.time_of_day,
             "recent_activity": None,
             "companion_mode": _codex_pool_ctx.companion_mode,
@@ -2842,6 +3155,14 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
             log.error("TTS background (_bg_speak) failed: %s", _exc)
 
     threading.Thread(target=_bg_speak, daemon=True).start()
+
+    # PTZ gesture dispatch: nod/shake based on response type (T027)
+    if PTZ_GESTURES_ENABLED and _tts_text:
+        _response_type = _detect_response_type(_tts_text)
+        if _response_type == "yes":
+            threading.Thread(target=_ptz_nod, daemon=True).start()
+        elif _response_type == "no":
+            threading.Thread(target=_ptz_shake, daemon=True).start()
 
     t_total = time.monotonic() - t0
     log.info(
@@ -3361,3 +3682,94 @@ def stats_progress(
         limit=limit,
     )
     return {"ok": True, "stats": stats}
+
+
+# ---------------------------------------------------------------------------
+# Face recognition + arrival endpoints (T013, T015, T020 — Phase B/C)
+# ---------------------------------------------------------------------------
+
+
+class PersonArrivedRequest(BaseModel):
+    event: str = "person_arrived"
+    camera_entity: str = ""
+    snapshot_url: str = ""
+    timestamp: str = ""
+
+
+@app.post("/v1/events/person_arrived", dependencies=[Depends(_require_auth)])
+async def person_arrived(req: PersonArrivedRequest) -> dict[str, Any]:
+    """
+    Called by HA automation when Reolink person detection fires.
+
+    Fetches snapshot, runs face recognition, and greets known persons.
+    """
+    state = _parse_mode()
+    conversation_id = state.get("conversation_id") or str(uuid.uuid4())
+
+    snapshot_bytes = await _fetch_ha_snapshot(req.snapshot_url)
+    if not snapshot_bytes:
+        log.warning("person_arrived: no snapshot bytes from %s", req.snapshot_url)
+        return {"ok": True, "identity": None, "action": "no_snapshot"}
+
+    result = await _handle_person_arrived(snapshot_bytes, conversation_id)
+    return {"ok": True, **result}
+
+
+@app.post("/v1/persons/{name}/enroll", dependencies=[Depends(_require_auth)])
+async def enroll_person(name: str, image: Any = None) -> dict[str, Any]:
+    """
+    Enroll or update a person's face. Accepts multipart image upload.
+    If no image is provided, attempts to use the latest camera snapshot.
+    """
+    from fastapi import UploadFile, File
+    # name must be a valid identifier
+    if not re.match(r"^[A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9_\- ]{0,39}$", name):
+        raise HTTPException(status_code=400, detail="invalid_name")
+
+    # Grab snapshot from HA camera if no image file was uploaded
+    jpeg_bytes: bytes = b""
+    if image is not None and hasattr(image, "read"):
+        jpeg_bytes = await image.read()
+
+    if not jpeg_bytes:
+        # Fall back to current camera snapshot via go2rtc / HA
+        snapshot_url = f"{HA_URL}/api/camera_proxy/camera.reolink_e1pro"
+        jpeg_bytes = await _fetch_ha_snapshot(snapshot_url)
+
+    if not jpeg_bytes:
+        raise HTTPException(status_code=422, detail="no_image_available")
+
+    result = await face_client.async_enroll(name, jpeg_bytes)
+    if not result.get("ok"):
+        raise HTTPException(status_code=422, detail=result.get("reason", "enroll_failed"))
+
+    # Also persist in aihub DB
+    try:
+        db.remember_identity(athlete_name=name, source="insightface_buffalo_l")
+    except Exception as exc:
+        log.warning("remember_identity failed for %s: %s", name, exc)
+
+    msg = f"Ok, jag kommer komma ihåg {name}!"
+    threading.Thread(
+        target=lambda: speak_to_camera(msg, "enrollment", event="reply"),
+        daemon=True,
+    ).start()
+
+    return {"ok": True, "name": name, "message": msg}
+
+
+@app.get("/v1/persons", dependencies=[Depends(_require_auth)])
+def list_persons() -> dict[str, Any]:
+    """List all enrolled persons and their presence state."""
+    names = db.list_athlete_names()
+    persons = []
+    for name in names:
+        presence = db.get_presence(name)
+        emb_count = db.get_embedding_count_for_athlete(name)
+        persons.append({
+            "name": name,
+            "embedding_count": emb_count,
+            "last_seen_at": presence.get("last_seen_at"),
+            "is_home": bool(presence.get("last_seen_at")),
+        })
+    return {"ok": True, "persons": persons}

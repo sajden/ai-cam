@@ -1,0 +1,7 @@
+insightface==0.7.3
+onnxruntime-gpu
+fastapi==0.115.6
+uvicorn==0.32.1
+numpy
+opencv-python-headless
+python-multipart

@@ -132,6 +132,19 @@ def _build_session_context_block(
         lines.append(f"Senaste aktivitet: {recent_activity[:120]}.")
     if not companion_mode:
         lines.append("Svarsstil: kortfattad och direkt.")
+
+    # Inject top-10 memory facts if a person is identified (T033)
+    if identity_name:
+        try:
+            from . import db as _db
+            facts = _db.get_facts_for_person(identity_name, limit=10, active_only=True)
+            if facts:
+                lines.append(f"\nVad jag vet om {identity_name}:")
+                for f in facts:
+                    lines.append(f"- {f['fact_text']}")
+        except Exception:
+            pass
+
     return ("\n\n[Session]\n" + "\n".join(lines)) if lines else ""
 
 

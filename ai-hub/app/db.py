@@ -175,6 +175,28 @@ def init_db() -> None:
                 PRIMARY KEY (pool_name, variant_key)
             );
 
+            CREATE TABLE IF NOT EXISTS person_presence (
+                person_name  TEXT PRIMARY KEY,
+                last_seen_at TEXT NOT NULL,
+                arrived_at   TEXT,
+                greeted_at   TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_facts (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_name    TEXT NOT NULL,
+                fact_text      TEXT NOT NULL,
+                category       TEXT NOT NULL DEFAULT 'general',
+                source_conv_id TEXT,
+                extracted_at   TEXT NOT NULL,
+                follow_up_date TEXT,
+                followed_up_at TEXT,
+                active         INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_memory_facts_person
+                ON memory_facts(person_name, active, extracted_at DESC);
+
             CREATE TABLE IF NOT EXISTS route_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 route_id TEXT NOT NULL,
@@ -1436,3 +1458,151 @@ def get_last_interaction_at(person_id: int | None) -> datetime | None:
     if not row:
         return None
     return _parse_ts(str(row["created_at"]))
+
+
+# ---------------------------------------------------------------------------
+# person_presence — arrival cooldown + presence tracking (T010)
+# ---------------------------------------------------------------------------
+
+
+def upsert_presence(person_name: str, last_seen_at: str | None = None) -> None:
+    """Update last_seen_at for a person, creating the row if needed."""
+    ts = last_seen_at or now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO person_presence (person_name, last_seen_at, arrived_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(person_name) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at
+            """,
+            (person_name, ts, ts),
+        )
+
+
+def set_greeted(person_name: str) -> None:
+    """Record that this person was greeted just now (updates arrived_at too)."""
+    ts = now_iso()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO person_presence (person_name, last_seen_at, arrived_at, greeted_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(person_name) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                arrived_at   = excluded.arrived_at,
+                greeted_at   = excluded.greeted_at
+            """,
+            (person_name, ts, ts, ts),
+        )
+
+
+def get_presence(person_name: str) -> dict[str, Any]:
+    """Return presence dict for a person or empty dict if unknown."""
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT person_name, last_seen_at, arrived_at, greeted_at
+            FROM person_presence
+            WHERE person_name = ?
+            LIMIT 1
+            """,
+            (person_name,),
+        ).fetchone()
+    return dict(row) if row else {}
+
+
+def is_new_arrival(person_name: str, cooldown_sec: int) -> bool:
+    """Return True if the person has not been greeted within cooldown_sec seconds."""
+    presence = get_presence(person_name)
+    if not presence or not presence.get("greeted_at"):
+        return True
+    greeted_at = _parse_ts(str(presence["greeted_at"]))
+    elapsed = (datetime.now(timezone.utc) - greeted_at).total_seconds()
+    return elapsed >= cooldown_sec
+
+
+# ---------------------------------------------------------------------------
+# mode_state helpers: last_unknown_face_at (T011)
+# ---------------------------------------------------------------------------
+
+
+def get_last_unknown_face_at() -> datetime | None:
+    """Return when an unknown face was last seen, or None."""
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT value FROM mode_state WHERE key = 'last_unknown_face_at' LIMIT 1"
+        ).fetchone()
+    if not row or not row["value"]:
+        return None
+    return _parse_ts(str(row["value"]))
+
+
+def set_last_unknown_face_at(ts: str | None = None) -> None:
+    """Record that an unknown face was just seen."""
+    set_mode_state({"last_unknown_face_at": ts or now_iso()})
+
+
+# ---------------------------------------------------------------------------
+# memory_facts — conversation fact extraction + follow-up scheduling (T030)
+# ---------------------------------------------------------------------------
+
+
+def insert_fact(
+    *,
+    person_name: str,
+    fact_text: str,
+    category: str = "general",
+    source_conv_id: str | None = None,
+    follow_up_date: str | None = None,
+) -> int:
+    """Insert a memory fact. Returns the new row id."""
+    ts = now_iso()
+    with connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO memory_facts
+                (person_name, fact_text, category, source_conv_id, extracted_at, follow_up_date, active)
+            VALUES (?, ?, ?, ?, ?, ?, 1)
+            """,
+            (person_name, fact_text, category, source_conv_id, ts, follow_up_date),
+        )
+    return int(cur.lastrowid)
+
+
+def get_facts_for_person(
+    person_name: str,
+    limit: int = 10,
+    active_only: bool = True,
+) -> list[dict[str, Any]]:
+    """Return most recent facts for a person."""
+    query = """
+        SELECT id, person_name, fact_text, category, source_conv_id,
+               extracted_at, follow_up_date, followed_up_at, active
+        FROM memory_facts
+        WHERE person_name = ?
+    """
+    params: list[Any] = [person_name]
+    if active_only:
+        query += " AND active = 1"
+    query += " ORDER BY extracted_at DESC LIMIT ?"
+    params.append(limit)
+    with connect() as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def mark_followed_up(fact_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE memory_facts SET followed_up_at = ? WHERE id = ?",
+            (now_iso(), fact_id),
+        )
+
+
+def deactivate_fact(fact_id: int) -> None:
+    with connect() as conn:
+        conn.execute(
+            "UPDATE memory_facts SET active = 0 WHERE id = ?",
+            (fact_id,),
+        )

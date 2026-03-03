@@ -1,8 +1,11 @@
 <!--
   SYNC IMPACT REPORT
   ==================
-  Version change: (unversioned template) → 1.0.0
-  This is the INITIAL constitution for ai-cam.
+  Version change: 1.0.0 → 1.0.1
+  PATCH amendment: Replace Frigate NVR with standalone go2rtc + HA camera.record.
+  Frigate bundled go2rtc replaced by alexxit/go2rtc standalone container; person detection
+  now handled by HA Reolink integration. Recording via HA camera.record to /config/www/.
+  Original version 1.0.0 — initial ai-cam constitution.
 
   New principles:
     I.   Privacy-by-Default
@@ -44,7 +47,7 @@ non-negotiable; cloud is a configurable escape hatch, not the default.
 ### II. Container-First Architecture
 
 Every service MUST run as a single-purpose Docker container defined in `docker-compose.yml`. Services MUST communicate
-exclusively over the internal Docker network (`ai_net`). Host-port bindings MUST only exist for UI access (e.g. Frigate,
+exclusively over the internal Docker network (`ai_net`). Host-port bindings MUST only exist for UI access (e.g. go2rtc,
 Home Assistant) and MUST be scoped to `UI_BIND_ADDR` (never hardcoded to `0.0.0.0` in production). A service MUST have
 one primary responsibility; shared logic MUST be exposed via HTTP API, not shared code.
 
@@ -93,7 +96,9 @@ system auditable and budget-predictable.
 - **STT**: Google Cloud STT (primary) + Whisper large-v3-turbo (fallback). Both configurable.
 - **TTS**: edge-tts (Microsoft Sofie sv-SE cloud) via camera-voice-bridge → audio-bridge (Windows).
 - **Vision**: OpenCV (local CV) + Ollama llava/llama3.2-vision (local VLM).
-- **NVR**: Frigate (object detection, recording, RTSP ingest).
+- **NVR**: go2rtc (standalone, `alexxit/go2rtc`) for RTSP re-publishing and WebRTC live view.
+  Person detection via HA Reolink integration (`binary_sensor.reolink_e1pro_person`).
+  Event recording via HA `camera.record` service to `/config/www/recordings/`.
 - **Wake word**: OpenWakeWord (local, model: hey_jarvis).
 - **Storage**: SQLite for aihub turn history (`./data/aihub/aihub.db`). No shared database.
 
@@ -105,7 +110,7 @@ system auditable and budget-predictable.
 - Service logs MUST use structured `INFO`/`WARNING`/`ERROR` levels. Debug noise MUST be gated behind an env flag.
 - The Codex CLI auth session (`./data/codex-auth`) MUST be re-authenticated via `./scripts/codex_reauth.sh`
   whenever a `401 refresh_token_reused` error appears — never delete the volume without backing up the session.
-- Privacy mode (Frigate recording on/off) MUST be togglable via MQTT without a container restart.
+- Privacy mode (recording on/off) MUST be controllable via ai-hub API or MQTT without a container restart.
 
 ## Governance
 
@@ -119,4 +124,4 @@ All implementation plans (`plan.md`) MUST include a **Constitution Check** gate 
 principles I–V before any Phase 0 research proceeds. Any violation MUST be logged in the Complexity Tracking table with
 justification.
 
-**Version**: 1.0.0 | **Ratified**: 2026-02-22 | **Last Amended**: 2026-02-22
+**Version**: 1.0.1 | **Ratified**: 2026-02-22 | **Last Amended**: 2026-03-03

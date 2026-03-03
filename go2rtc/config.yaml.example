@@ -1,0 +1,26 @@
+# go2rtc configuration
+# Copy this file to config.yaml and fill in your camera credentials.
+#
+# Stream names must match CAMERA_LISTENER_RTSP_URL, AIHUB_SNAPSHOT_STREAM, etc.
+# Default: reolink_e1pro_main / reolink_e1pro_sub
+
+streams:
+  reolink_e1pro_main:
+    # Replace 192.168.1.50 with your camera IP, admin/password with your credentials.
+    - rtsp://admin:password@192.168.1.50/h264Preview_01_main
+
+  reolink_e1pro_sub:
+    - rtsp://admin:password@192.168.1.50/h264Preview_01_sub
+
+# Optional: enable WebRTC for browser live view in Home Assistant
+# webrtc:
+#   listen: ":8555"
+#   candidates:
+#     - 192.168.1.X:8555  # your Docker host LAN IP
+
+api:
+  listen: ":1984"
+  origin: "*"
+
+rtsp:
+  listen: ":8554"
