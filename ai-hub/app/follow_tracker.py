@@ -79,6 +79,7 @@ class SoftFollowController:
 
         self._lock = threading.Lock()
         self._running = False
+        self._suspended = False  # pause PTZ moves without stopping the loop
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
@@ -178,6 +179,15 @@ class SoftFollowController:
             self._thread.start()
         log.info("Soft follow started")
         return True, "started"
+
+    def suspend_ptz(self) -> None:
+        """Block PTZ moves (e.g. during a conversation turn). Thread-safe."""
+        self._suspended = True
+
+    def resume_ptz(self) -> None:
+        """Re-enable PTZ moves after a conversation turn. Thread-safe."""
+        self._suspended = False
+        self._last_move_at = 0.0  # skip cooldown so follow re-locks quickly
 
     def stop(self) -> tuple[bool, str]:
         with self._lock:
@@ -423,6 +433,8 @@ class SoftFollowController:
 
     def _maybe_issue_move(self, direction: str, now: float, source: str) -> None:
         if not direction:
+            return
+        if self._suspended:
             return
         if (now - self._last_move_at) < self._move_cooldown_sec:
             return

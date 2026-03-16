@@ -21,8 +21,8 @@ try:
 except Exception:  # pragma: no cover
     Image = None
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from . import db
@@ -58,7 +58,7 @@ from .response_pool import PoolContext
 from .intent_detector import detect_camera_intent
 from .follow_tracker import SoftFollowController
 from .live_video import LiveVideoFeed
-from .ollama_client import ask_vision_model, classify_as_vision
+from .ollama_client import ask_vision_model, classify_as_vision, warmup_ollama
 from .policy import evaluate_candidate_egress, should_use_codex
 from .rep_counter import SimpleVerticalRepCounter
 from .reolink_client import execute_camera_intent, get_shared_client as _get_reolink_client
@@ -255,6 +255,12 @@ HA_TOKEN = os.getenv("AIHUB_HA_TOKEN", "").strip()
 MEMORY_EXTRACTION_ENABLED = os.getenv("AIHUB_MEMORY_EXTRACTION_ENABLED", "0").strip() == "1"
 PROACTIVE_ENABLED = os.getenv("AIHUB_PROACTIVE_ENABLED", "0").strip() == "1"
 MORNING_GREETING_TIME = os.getenv("AIHUB_MORNING_GREETING_TIME", "07:00").strip()
+PRESENCE_ENABLED = os.getenv("AIHUB_PRESENCE_ENABLED", "1").strip() == "1"
+PRESENCE_ENTITY = os.getenv("AIHUB_PRESENCE_ENTITY", "binary_sensor.reolink_e1pro_person").strip()
+PRESENCE_POLL_SEC = float(os.getenv("AIHUB_PRESENCE_POLL_SEC", "5"))
+PRESENCE_MIN_TRIP_SEC = int(os.getenv("AIHUB_PRESENCE_MIN_TRIP_SEC", "60"))
+PRESENCE_MAX_TRIP_SEC = int(os.getenv("AIHUB_PRESENCE_MAX_TRIP_SEC", "14400"))
+PRESENCE_SITTING_ALERT_SEC = int(os.getenv("AIHUB_PRESENCE_SITTING_ALERT_SEC", "7200"))
 
 # Enrollment intent pattern (voice: "Det här är Sebastian")
 _ENROLL_INTENT = re.compile(
@@ -408,6 +414,7 @@ _live_video_started = False
 _live_video_feed: LiveVideoFeed | None = None
 _rep_counter: SimpleVerticalRepCounter | None = None
 _soft_follow: SoftFollowController | None = None
+_presence_tracker: "PresenceTracker | None" = None
 _PENDING_IDENTITY_TASK_KEY = "pending_identity_task_session_id"
 _PENDING_IDENTITY_CONV_KEY = "pending_identity_conversation_id"
 _PENDING_IDENTITY_EMBED_KEY = "pending_identity_embedding_json"
@@ -1258,9 +1265,9 @@ def _camera_look_answer(
                 return f"Jag kunde inte ta bild just nu{reason}.", executed_actions, codex_ms_added
         # Person found — fall through to VLM so we can answer the actual question
 
-    # Collect 5 frames ~0.3s apart to give Qwen temporal context for motion.
-    _MULTI_FRAME_COUNT = 5
-    _MULTI_FRAME_INTERVAL = 0.3
+    # Collect 2 frames ~0.5s apart — enough for motion context, keeps VLM fast.
+    _MULTI_FRAME_COUNT = 2
+    _MULTI_FRAME_INTERVAL = 0.5
     frame_ok, frame_data, _frame_bgr, frame_source = _fetch_vision_frame()
     if not frame_ok:
         return (
@@ -1280,11 +1287,11 @@ def _camera_look_answer(
     n_frames = 1 + len(extra_frames)
     span_sec = round(n_frames * _MULTI_FRAME_INTERVAL, 1)
     vlm_prompt = (
-        f"Du analyserar {n_frames} bilder från en kamera tagna {_MULTI_FRAME_INTERVAL}s isär "
-        f"(täcker {span_sec}s rörelse).\n"
-        f"Fråga från användaren: \"{user_text}\"\n"
-        "Svara på svenska. Beskriv vad personen gör och hur de rör sig. "
-        "Var konkret om kläder, position och rörelse. Om osäker, säg det."
+        f"Du är ett kameraöga med realtidsvy. Du ser en livesekvens om {span_sec}s.\n"
+        f"Fråga: \"{user_text}\"\n"
+        "Svara på svenska i första person, direkt och kortfattat — som om du tittar live just nu. "
+        "Beskriv personen, position, kläder och rörelse. Säg inte 'bilder' eller 'bilderna'. "
+        "Om du är osäker, säg det rakt ut."
     )
     vlm_ok, vlm_text = ask_vision_model(
         vlm_prompt,
@@ -1349,6 +1356,111 @@ def _is_fitness_task(task_type: str, task_goal: str) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# Desk presence tracker (004-presence-tracking)
+# ---------------------------------------------------------------------------
+
+class PresenceTracker:
+    """Polls the HA Reolink person sensor and records away-trips to desk_trips."""
+
+    def __init__(self) -> None:
+        from .actions import load_ha_config, get_ha_state as _get_ha_state
+        self._load_ha_config = load_ha_config
+        self._get_ha_state = _get_ha_state
+        self._person_present: bool = True
+        self._away_since: float | None = None
+        self._open_trip_id: int | None = None
+        self._at_desk_since: float = time.monotonic()
+        self._last_sitting_comment_at: float = 0.0
+        self._stop_event = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._run, daemon=True, name="presence-tracker").start()
+        log.info(
+            "Presence tracker started (entity=%s, poll=%ds)",
+            PRESENCE_ENTITY, int(PRESENCE_POLL_SEC),
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+    def get_today_summary(self) -> dict:
+        today = datetime.now(timezone.utc).astimezone().date().isoformat()
+        return db.get_desk_summary_today(today)
+
+    def get_week_summary(self) -> list:
+        return db.get_desk_summary_week(7)
+
+    def get_sitting_comment(self) -> str | None:
+        """Return a Swedish sitting-streak comment at most once per hour."""
+        now = time.monotonic()
+        streak_sec = now - self._at_desk_since
+        if streak_sec >= PRESENCE_SITTING_ALERT_SEC and (now - self._last_sitting_comment_at) >= 3600:
+            self._last_sitting_comment_at = now
+            hours = streak_sec / 3600
+            if hours >= 1:
+                return f"Du har suttit i {hours:.1f} timmar utan paus — kanske dags att röra lite på sig?"
+            mins = int(streak_sec / 60)
+            return f"Du har suttit i {mins} minuter utan paus."
+        return None
+
+    def _time_of_day(self) -> str:
+        hour = datetime.now().hour
+        if 6 <= hour < 12:
+            return "morning"
+        if 12 <= hour < 18:
+            return "afternoon"
+        return "evening"
+
+    def _run(self) -> None:
+        cfg = self._load_ha_config()
+        while not self._stop_event.is_set():
+            try:
+                state, reason = self._get_ha_state(cfg, PRESENCE_ENTITY)
+                if state is not None:
+                    present = (state.lower() == "on")
+                    now_mono = time.monotonic()
+                    now_utc = datetime.now(timezone.utc).isoformat()
+                    today = datetime.now(timezone.utc).astimezone().date().isoformat()
+
+                    if self._person_present and not present:
+                        # Person just left
+                        self._away_since = now_mono
+                        tod = self._time_of_day()
+                        self._open_trip_id = db.log_desk_trip_start(now_utc, today, tod)
+                        self._person_present = False
+
+                    elif not self._person_present and present:
+                        # Person just returned
+                        self._person_present = True
+                        self._at_desk_since = now_mono
+                        if self._away_since is not None and self._open_trip_id is not None:
+                            duration = int(now_mono - self._away_since)
+                            if duration >= PRESENCE_MIN_TRIP_SEC:
+                                db.log_desk_trip_end(self._open_trip_id, now_utc, duration)
+                            else:
+                                # Too short — discard (delete the open row)
+                                try:
+                                    import sqlite3 as _sq
+                                    with db.connect() as _c:
+                                        _c.execute(
+                                            "DELETE FROM desk_trips WHERE id = ?",
+                                            (self._open_trip_id,),
+                                        )
+                                except Exception:
+                                    pass
+                        self._away_since = None
+                        self._open_trip_id = None
+
+                else:
+                    log.warning("Presence tracker: HA state unavailable (%s)", reason)
+
+            except Exception as exc:
+                log.warning("Presence tracker poll error: %s", exc)
+
+            self._stop_event.wait(timeout=PRESENCE_POLL_SEC)
+
+
 def _start_live_video_once() -> None:
     global _live_video_started, _live_video_feed, _rep_counter, _soft_follow
     if _live_video_started:
@@ -1404,6 +1516,7 @@ def _start_live_video_once() -> None:
             full_pan_steps=SOFT_FOLLOW_FULL_PAN_STEPS,
         )
         log.info("Soft follow initialized (enabled=%s, available=%s)", SOFT_FOLLOW_ENABLED, _soft_follow.available())
+        _soft_follow.start()
 
 
 def _soft_follow_frame_provider() -> Any | None:
@@ -1668,7 +1781,12 @@ async def _handle_person_arrived(
     matched: bool = result.get("matched", False)
     name: str | None = result.get("name")
 
-    # Step 2 — presence check
+    # Step 2 — bail early if no face in frame at all
+    if not result.get("face_detected", False):
+        log.debug("person_arrived: no face detected in snapshot, skipping")
+        return {"identity": None, "action": "no_face", "matched": False}
+
+    # Step 3 — presence check
     if matched and name:
         new_arrival = db.is_new_arrival(name, ARRIVAL_COOLDOWN_SEC)
         db.upsert_presence(name)
@@ -1731,35 +1849,48 @@ async def _handle_person_arrived(
 # PTZ gesture helpers (T022–T025, Phase C)
 # ---------------------------------------------------------------------------
 
-def _ptz_nod() -> None:
-    """Camera nods (up then down). Non-blocking, exceptions logged."""
+def _ptz_face_user() -> None:
+    """Snap camera to home preset so it faces the user before speaking."""
     try:
         rc = _get_reolink_client()
-        rc.ptz_burst("Up", PTZ_NOD_SPEED, PTZ_NOD_DURATION_SEC)
-        time.sleep(PTZ_NOD_DURATION_SEC + 0.1)
-        rc.ptz_burst("Down", PTZ_NOD_SPEED, PTZ_NOD_DURATION_SEC)
+        rc.ptz_preset(0)
+    except Exception as exc:
+        log.warning("PTZ face_user failed: %s", exc)
+
+
+def _ptz_nod() -> None:
+    """Two human-like nods: down→up, pause, down→up (second nod slightly slower)."""
+    try:
+        time.sleep(1.5)  # wait for TTS to reach the speaker (~1.5s render+buffer lag)
+        rc = _get_reolink_client()
+        dur = PTZ_NOD_DURATION_SEC
+        # First nod — decisive
+        rc.ptz_burst("Down", PTZ_NOD_SPEED, dur)
+        time.sleep(dur + 0.10)
+        rc.ptz_burst("Up", PTZ_NOD_SPEED, dur)
+        time.sleep(0.20)
+        # Second nod — softer, return to center
+        rc.ptz_burst("Down", max(PTZ_NOD_SPEED - 3, 4), dur)
+        time.sleep(dur + 0.15)
+        rc.ptz_burst("Up", max(PTZ_NOD_SPEED - 3, 4), dur)
     except Exception as exc:
         log.warning("PTZ nod failed: %s", exc)
 
 
 def _ptz_shake() -> None:
-    """Camera shakes head (left then right). Non-blocking, exceptions logged."""
+    """Human-like head shake: left→right→left (returns to centre)."""
     try:
+        time.sleep(1.5)  # wait for TTS to reach the speaker
         rc = _get_reolink_client()
-        rc.ptz_burst("Left", PTZ_SHAKE_SPEED, PTZ_SHAKE_DURATION_SEC)
-        time.sleep(PTZ_SHAKE_DURATION_SEC + 0.1)
-        rc.ptz_burst("Right", PTZ_SHAKE_SPEED, PTZ_SHAKE_DURATION_SEC)
+        dur = PTZ_SHAKE_DURATION_SEC
+        spd = PTZ_SHAKE_SPEED
+        rc.ptz_burst("Left", spd, dur)
+        time.sleep(dur + 0.10)
+        rc.ptz_burst("Right", spd, dur * 1.8)   # wider swing through centre
+        time.sleep(dur * 1.8 + 0.10)
+        rc.ptz_burst("Left", max(spd - 3, 4), dur)  # softer return to centre
     except Exception as exc:
         log.warning("PTZ shake failed: %s", exc)
-
-
-def _ptz_thinking() -> None:
-    """Camera looks down (thinking). Non-blocking."""
-    try:
-        rc = _get_reolink_client()
-        rc.ptz_burst("Down", 6, 0.4)
-    except Exception as exc:
-        log.warning("PTZ thinking failed: %s", exc)
 
 
 def _detect_response_type(text: str) -> str:
@@ -1865,6 +1996,12 @@ def startup() -> None:
     _start_live_video_once()
     _start_vision_loop_once()
     _schedule_morning_greeting()
+    warmup_ollama()
+    global _presence_tracker
+    db.close_open_trips(datetime.now(timezone.utc).isoformat())
+    if PRESENCE_ENABLED:
+        _presence_tracker = PresenceTracker()
+        _presence_tracker.start()
 
 
 @app.get("/v1/health", dependencies=[Depends(_require_auth)])
@@ -2156,6 +2293,16 @@ class ConversationTurnRequest(BaseModel):
 @app.post("/v1/conversation/turn", dependencies=[Depends(_require_auth)])
 def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
     cancel_followup()  # T024: suppress any pending follow-up on new turn
+    if _soft_follow is not None:
+        _soft_follow.suspend_ptz()  # stop PTZ spam while Reolink is needed for this turn
+    try:
+        return _conversation_turn_inner(req)
+    finally:
+        if _soft_follow is not None:
+            _soft_follow.resume_ptz()
+
+
+def _conversation_turn_inner(req: ConversationTurnRequest) -> dict[str, Any]:
     global _last_ollama_vision_at
     req_started = time.monotonic()
     req_received_at = datetime.now(timezone.utc)
@@ -2870,9 +3017,7 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
                 daemon=True,
             ).start()
 
-        # PTZ thinking pose while Codex processes (T028)
-        if PTZ_GESTURES_ENABLED:
-            threading.Thread(target=_ptz_thinking, daemon=True).start()
+        # (thinking pose removed — caused camera to look away during Codex call)
 
         codex_call_started = time.monotonic()
         _codex_pool_ctx = _build_pool_context(req.conversation_id)  # T030
@@ -3090,6 +3235,13 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
     ).strip()
     # Clean up double spaces
     assistant_text = re.sub(r"  +", " ", assistant_text)
+
+    # Sitting streak comment — append at most once per hour (T015, US2)
+    if _presence_tracker is not None and PRESENCE_ENABLED:
+        _sit_comment = _presence_tracker.get_sitting_comment()
+        if _sit_comment:
+            assistant_text = assistant_text + "\n" + _sit_comment
+
     camera_actions_ms = _to_ms(time.monotonic() - actions_started)
     _warn_if_over_budget(
         "camera_actions",
@@ -3136,6 +3288,8 @@ def conversation_turn(req: ConversationTurnRequest) -> dict[str, Any]:
 
     def _bg_speak() -> None:
         try:
+            if PTZ_GESTURES_ENABLED:
+                _ptz_face_user()
             t_s = time.monotonic()
             ok, reason = speak_to_camera(_tts_text, _tts_source, event="reply")
             t_tts_ms = _to_ms(time.monotonic() - t_s)
@@ -3706,9 +3860,15 @@ async def person_arrived(req: PersonArrivedRequest) -> dict[str, Any]:
     state = _parse_mode()
     conversation_id = state.get("conversation_id") or str(uuid.uuid4())
 
-    snapshot_bytes = await _fetch_ha_snapshot(req.snapshot_url)
+    snapshot_url = req.snapshot_url
+    if not snapshot_url:
+        # Fall back to go2rtc frame snapshot (no HA camera entity needed)
+        go2rtc_base = os.getenv("AIHUB_GO2RTC_BASE_URL", "http://go2rtc:1984")
+        snapshot_url = f"{go2rtc_base}/api/frame.jpeg?src=reolink_e1pro_main"
+
+    snapshot_bytes = await _fetch_ha_snapshot(snapshot_url)
     if not snapshot_bytes:
-        log.warning("person_arrived: no snapshot bytes from %s", req.snapshot_url)
+        log.warning("person_arrived: no snapshot bytes from %s", snapshot_url)
         return {"ok": True, "identity": None, "action": "no_snapshot"}
 
     result = await _handle_person_arrived(snapshot_bytes, conversation_id)
@@ -3716,12 +3876,11 @@ async def person_arrived(req: PersonArrivedRequest) -> dict[str, Any]:
 
 
 @app.post("/v1/persons/{name}/enroll", dependencies=[Depends(_require_auth)])
-async def enroll_person(name: str, image: Any = None) -> dict[str, Any]:
+async def enroll_person(name: str, image: UploadFile = File(None)) -> dict[str, Any]:
     """
     Enroll or update a person's face. Accepts multipart image upload.
     If no image is provided, attempts to use the latest camera snapshot.
     """
-    from fastapi import UploadFile, File
     # name must be a valid identifier
     if not re.match(r"^[A-Za-zÅÄÖåäö][A-Za-zÅÄÖåäö0-9_\- ]{0,39}$", name):
         raise HTTPException(status_code=400, detail="invalid_name")
@@ -3732,8 +3891,9 @@ async def enroll_person(name: str, image: Any = None) -> dict[str, Any]:
         jpeg_bytes = await image.read()
 
     if not jpeg_bytes:
-        # Fall back to current camera snapshot via go2rtc / HA
-        snapshot_url = f"{HA_URL}/api/camera_proxy/camera.reolink_e1pro"
+        # Fall back to go2rtc frame snapshot
+        go2rtc_base = os.getenv("AIHUB_GO2RTC_BASE_URL", "http://go2rtc:1984")
+        snapshot_url = f"{go2rtc_base}/api/frame.jpeg?src=reolink_e1pro_main"
         jpeg_bytes = await _fetch_ha_snapshot(snapshot_url)
 
     if not jpeg_bytes:
@@ -3773,3 +3933,48 @@ def list_persons() -> dict[str, Any]:
             "is_home": bool(presence.get("last_seen_at")),
         })
     return {"ok": True, "persons": persons}
+
+
+# ── Departure board ───────────────────────────────────────────────────────────
+
+@app.get("/departures", response_class=HTMLResponse)
+def departure_board() -> HTMLResponse:
+    """Serve the SL departure board page (for Chromecast)."""
+    from .departures import DEPARTURE_BOARD_HTML
+    return HTMLResponse(content=DEPARTURE_BOARD_HTML)
+
+
+@app.get("/departures/api")
+def departure_api() -> JSONResponse:
+    """Proxy SL departures — avoids CORS issues on the Chromecast."""
+    from .departures import fetch_departures
+    data = fetch_departures()
+    return JSONResponse(content=data)
+
+
+@app.get("/departures/vehicles")
+def departure_vehicles() -> JSONResponse:
+    """Return nearby vehicle positions from GTFS-RT as JSON."""
+    from .departures import fetch_vehicles
+    return JSONResponse(content=fetch_vehicles())
+
+
+@app.get("/departures/disruptions")
+def departure_disruptions() -> JSONResponse:
+    """Return active SL traffic disruptions as JSON."""
+    from .departures import fetch_disruptions
+    return JSONResponse(content=fetch_disruptions())
+
+
+@app.post("/departures/cast")
+def departure_cast() -> JSONResponse:
+    """Cast the departure board directly to the Chromecast (no HTTPS required)."""
+    from .departures import cast_departure_board
+    return JSONResponse(content=cast_departure_board())
+
+
+@app.post("/departures/stop")
+def departure_stop() -> JSONResponse:
+    """Stop the Chromecast."""
+    from .departures import stop_cast
+    return JSONResponse(content=stop_cast())

@@ -172,6 +172,7 @@ LATENCY_WARN_WAKE_HTTP_MS = _env_float("CAMERA_LISTENER_LATENCY_WARN_WAKE_HTTP_M
 LATENCY_WARN_TURN_HTTP_MS = _env_float("CAMERA_LISTENER_LATENCY_WARN_TURN_HTTP_MS", 3500.0)
 LATENCY_WARN_INTERRUPT_HTTP_MS = _env_float("CAMERA_LISTENER_LATENCY_WARN_INTERRUPT_HTTP_MS", 500.0)
 ASSISTANT_ECHO_GUARD_SEC = _env_float("CAMERA_LISTENER_ASSISTANT_ECHO_GUARD_SEC", 5.0)
+ECHO_GRACE_SEC = _env_float("CAMERA_LISTENER_ECHO_GRACE_SEC", 0.3)
 ECHO_SIMILARITY_THRESHOLD = _env_float("CAMERA_LISTENER_ECHO_SIMILARITY_THRESHOLD", 0.84)
 MIN_WORDS_FORWARD = _env_int("CAMERA_LISTENER_MIN_WORDS_FORWARD", 2)
 FILLER_WORDS = {
@@ -644,6 +645,7 @@ class AIHubClient:
             self.headers["Authorization"] = f"Bearer {AIHUB_TOKEN}"
         self._speaker_cache: tuple[float, bool] = (0.0, False)
         self._speaker_cache_ttl = 0.5  # 500ms cache
+        self._speaker_done_at_unix: float | None = None
         self.last_speaker_state_ms = 0.0
         self.last_wake_http_ms = 0.0
         self.last_turn_http_ms = 0.0
@@ -662,7 +664,15 @@ class AIHubClient:
                 timeout=_timeout_pair(SPEAKER_STATE_TIMEOUT_SEC),
             )
             resp.raise_for_status()
-            playing = bool(resp.json().get("speaker_playing", False))
+            data = resp.json()
+            playing = bool(data.get("speaker_playing", False))
+            done_at_raw = data.get("speaker_done_at", "")
+            if done_at_raw:
+                try:
+                    dt = datetime.fromisoformat(done_at_raw)
+                    self._speaker_done_at_unix = dt.timestamp()
+                except Exception:
+                    pass
         except Exception:
             playing = False
         self.last_speaker_state_ms = _ms_since(started)
@@ -1538,6 +1548,7 @@ def run() -> None:
     worker = ResponseWorker(client, state)
     segmenter = SpeechSegmenter()
     logger.info("Pipeline: non-blocking ResponseWorker started")
+    _prev_real_speaker_playing: bool = False
 
     while True:
         proc: subprocess.Popen[bytes] | None = None
@@ -1557,8 +1568,17 @@ def run() -> None:
                 now_ts = time.time()
                 in_conversation = state.conversation_active(now_ts)
 
-                speaker_playing = client.speaker_playing()
+                real_speaker_playing = client.speaker_playing()
                 state.last_speaker_state_ms = client.last_speaker_state_ms
+                # Detect playback-end transition → collapse echo guard to short grace period.
+                if _prev_real_speaker_playing and not real_speaker_playing:
+                    done_at = client._speaker_done_at_unix
+                    if done_at is not None and done_at >= now_ts - 30.0:
+                        state.assistant_guard_until = done_at + ECHO_GRACE_SEC
+                    elif state.assistant_guard_until > now_ts:
+                        state.assistant_guard_until = now_ts + ECHO_GRACE_SEC
+                _prev_real_speaker_playing = real_speaker_playing
+                speaker_playing = real_speaker_playing
                 if now_ts < state.ignore_speaker_until:
                     speaker_playing = False
                 if now_ts >= next_status_heartbeat:
@@ -1691,6 +1711,9 @@ def run() -> None:
                                 state.last_interrupt_http_ms = client.last_interrupt_http_ms
                                 if not ok_interrupt:
                                     logger.debug("Speaker interrupt failed: %s", reason_interrupt)
+                                else:
+                                    # Speaker stopped — allow immediate follow-up after echo decays.
+                                    state.assistant_guard_until = now_ts + ECHO_GRACE_SEC
                             _handle_transcript(
                                 state,
                                 worker,

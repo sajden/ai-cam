@@ -5,6 +5,8 @@ import os
 import re
 import urllib.error
 import urllib.request
+from datetime import timezone
+from datetime import datetime
 from typing import Any
 
 
@@ -144,6 +146,47 @@ def _build_session_context_block(
                     lines.append(f"- {f['fact_text']}")
         except Exception:
             pass
+
+    # Daily desk activity summary (T012, US1)
+    try:
+        from . import db as _db
+        _today = datetime.now(timezone.utc).astimezone().date().isoformat()
+        desk = _db.get_desk_summary_today(_today)
+        if desk["trip_count"] > 0 or desk["longest_sitting_sec"] > 1800:
+            _avg_min = int(desk["avg_duration_sec"] / 60) if desk["avg_duration_sec"] else 0
+            _long_min = int(desk["longest_trip_sec"] / 60) if desk["longest_trip_sec"] else 0
+            _sit_min = int(desk["longest_sitting_sec"] / 60) if desk["longest_sitting_sec"] else 0
+            lines.append(
+                f"\n[Skrivbordsaktivitet idag]\n"
+                f"{desk['trip_count']} pauser (snitt {_avg_min} min, längst {_long_min} min), "
+                f"suttit sammanhängande: {_sit_min} min"
+            )
+    except Exception:
+        pass
+
+    # Weekly desk patterns (T016, US3)
+    try:
+        week = _db.get_desk_summary_week(7)  # type: ignore[possibly-undefined]
+        _days_with_data = [d for d in week if d["trip_count"] > 0]
+        if len(_days_with_data) >= 3:
+            _avg_trips = sum(d["trip_count"] for d in _days_with_data) / len(_days_with_data)
+            _most = max(_days_with_data, key=lambda d: d["trip_count"])
+            _least = min(_days_with_data, key=lambda d: d["trip_count"])
+            lines.append(
+                f"\n[Veckovanor]\n"
+                f"Snitt {_avg_trips:.1f} pauser/dag, "
+                f"mest aktiv: {_most['date']}, minst: {_least['date']}"
+            )
+            # T017: deviation comment for today
+            _today_data = next((d for d in week if d["date"] == _today), None)
+            if _today_data and _avg_trips > 0:
+                _diff_pct = (_today_data["trip_count"] - _avg_trips) / _avg_trips
+                if _diff_pct >= 0.30:
+                    lines.append("Idag rör du dig mer än vanligt")
+                elif _diff_pct <= -0.30:
+                    lines.append("Idag rör du dig mindre än vanligt")
+    except Exception:
+        pass
 
     return ("\n\n[Session]\n" + "\n".join(lines)) if lines else ""
 

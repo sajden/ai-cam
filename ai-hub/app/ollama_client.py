@@ -194,3 +194,49 @@ def ask_vision_model(
             return True, text2
         return False, f"{text}; retry={text2}"
     return False, text
+
+
+def warmup_ollama() -> None:
+    """Load the vision model into GPU memory at startup.
+
+    Sends a minimal 1x1 JPEG with a short prompt so that the first real
+    camera_look call hits a warm model (~1 s) instead of a cold one (~21 s).
+    Runs in a daemon thread — never blocks startup.
+    """
+    import io
+    import logging
+    import threading
+
+    log = logging.getLogger(__name__)
+
+    def _warmup() -> None:
+        try:
+            # Minimal JPEG (64x64 — 1x1 causes Ollama HTTP 500)
+            if Image is None:
+                return
+            img = Image.new("RGB", (64, 64), (128, 128, 128))
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=50)
+            jpeg = buf.getvalue()
+            images_b64 = [base64.b64encode(jpeg).decode("ascii")]
+            payload = {
+                "model": OLLAMA_VISION_MODEL,
+                "prompt": "ok",
+                "images": images_b64,
+                "stream": False,
+                "options": {"num_predict": 1},
+            }
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                method="POST",
+                data=data,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                resp.read()
+            log.info("Ollama vision model warm (model=%s)", OLLAMA_VISION_MODEL)
+        except Exception as exc:
+            log.warning("Ollama warmup failed (non-fatal): %s", exc)
+
+    threading.Thread(target=_warmup, daemon=True, name="ollama-warmup").start()

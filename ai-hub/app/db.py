@@ -224,6 +224,17 @@ def init_db() -> None:
                 tts_reason TEXT,
                 created_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS desk_trips (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                date         TEXT    NOT NULL,
+                left_at      TEXT    NOT NULL,
+                returned_at  TEXT,
+                duration_sec INTEGER,
+                time_of_day  TEXT    NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_desk_trips_date ON desk_trips(date);
             """
         )
     _seed_defaults()
@@ -1606,3 +1617,132 @@ def deactivate_fact(fact_id: int) -> None:
             "UPDATE memory_facts SET active = 0 WHERE id = ?",
             (fact_id,),
         )
+
+
+# ---------------------------------------------------------------------------
+# desk_trips — desk presence tracking (004-presence-tracking)
+# ---------------------------------------------------------------------------
+
+def log_desk_trip_start(left_at: str, date: str, time_of_day: str) -> int:
+    """Insert an open trip row (returned_at NULL). Returns new row id."""
+    with connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO desk_trips (date, left_at, time_of_day) VALUES (?, ?, ?)",
+            (date, left_at, time_of_day),
+        )
+        return cur.lastrowid  # type: ignore[return-value]
+
+
+def log_desk_trip_end(trip_id: int, returned_at: str, duration_sec: int) -> None:
+    """Close an open trip row with return time and duration."""
+    with connect() as conn:
+        conn.execute(
+            "UPDATE desk_trips SET returned_at = ?, duration_sec = ? WHERE id = ?",
+            (returned_at, duration_sec, trip_id),
+        )
+
+
+def get_desk_summary_today(date: str) -> dict[str, Any]:
+    """Return aggregated desk stats for *date* (YYYY-MM-DD).
+
+    Only counts completed trips with 60 s ≤ duration ≤ 14400 s.
+    Returns zeros when no data exists.
+    """
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT left_at, returned_at, duration_sec
+            FROM desk_trips
+            WHERE date = ?
+              AND returned_at IS NOT NULL
+              AND duration_sec >= 60
+              AND duration_sec <= 14400
+            ORDER BY left_at
+            """,
+            (date,),
+        ).fetchall()
+
+    if not rows:
+        last_row = None
+        with connect() as conn:
+            last_row = conn.execute(
+                "SELECT left_at FROM desk_trips WHERE date = ? AND returned_at IS NULL",
+                (date,),
+            ).fetchone()
+        return {
+            "trip_count": 0,
+            "avg_duration_sec": 0,
+            "longest_trip_sec": 0,
+            "longest_sitting_sec": 0,
+            "last_left_at": last_row["left_at"] if last_row else None,
+        }
+
+    durations = [r["duration_sec"] for r in rows]
+    trip_count = len(durations)
+    avg_duration_sec = int(sum(durations) / trip_count)
+    longest_trip_sec = max(durations)
+
+    # Longest unbroken sitting streak = longest gap between consecutive trips
+    # (or from day start if only one trip)
+    gaps: list[int] = []
+    for i in range(1, len(rows)):
+        prev_return = rows[i - 1]["returned_at"]
+        next_leave = rows[i]["left_at"]
+        try:
+            t1 = datetime.fromisoformat(prev_return.replace("Z", "+00:00"))
+            t2 = datetime.fromisoformat(next_leave.replace("Z", "+00:00"))
+            gaps.append(max(0, int((t2 - t1).total_seconds())))
+        except Exception:
+            gaps.append(0)
+    longest_sitting_sec = max(gaps) if gaps else 0
+
+    last_left = rows[-1]["left_at"]
+    with connect() as conn:
+        open_row = conn.execute(
+            "SELECT left_at FROM desk_trips WHERE date = ? AND returned_at IS NULL",
+            (date,),
+        ).fetchone()
+    if open_row:
+        last_left = open_row["left_at"]
+
+    return {
+        "trip_count": trip_count,
+        "avg_duration_sec": avg_duration_sec,
+        "longest_trip_sec": longest_trip_sec,
+        "longest_sitting_sec": longest_sitting_sec,
+        "last_left_at": last_left,
+    }
+
+
+def get_desk_summary_week(days: int = 7) -> list[dict[str, Any]]:
+    """Return one summary dict per day for the last *days* days (newest last).
+
+    Days with no data return zeros.
+    """
+    result = []
+    today = datetime.now(timezone.utc).date()
+    for i in range(days - 1, -1, -1):
+        d = (today - timedelta(days=i)).isoformat()
+        summary = get_desk_summary_today(d)
+        summary["date"] = d
+        result.append(summary)
+    return result
+
+
+def close_open_trips(now_utc: str) -> None:
+    """Close any trip rows where returned_at IS NULL (service restart recovery)."""
+    with connect() as conn:
+        open_rows = conn.execute(
+            "SELECT id, left_at FROM desk_trips WHERE returned_at IS NULL",
+        ).fetchall()
+        for row in open_rows:
+            try:
+                t_left = datetime.fromisoformat(row["left_at"].replace("Z", "+00:00"))
+                t_now = datetime.fromisoformat(now_utc.replace("Z", "+00:00"))
+                duration = max(0, int((t_now - t_left).total_seconds()))
+            except Exception:
+                duration = 0
+            conn.execute(
+                "UPDATE desk_trips SET returned_at = ?, duration_sec = ? WHERE id = ?",
+                (now_utc, duration, row["id"]),
+            )

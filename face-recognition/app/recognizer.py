@@ -88,6 +88,7 @@ class FaceRecognizer:
 
         threshold = float(os.getenv("FACE_RECOGNITION_THRESHOLD", str(_THRESHOLD)))
         matched = best_score >= threshold
+        logger.info("Best match: %s score=%.4f threshold=%.2f matched=%s", best_name, best_score, threshold, matched)
         return {
             "matched": matched,
             "name": best_name if matched else None,

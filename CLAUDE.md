@@ -5,6 +5,8 @@ Auto-generated from all feature plans. Last updated: 2026-02-26
 ## Active Technologies
 - Python 3.11 + insightface 0.7.3, onnxruntime-gpu, FastAPI (existing), httpx (HA snapshot fetch), numpy (002-face-recognition)
 - SQLite aihub.db — 2 new tables (`person_presence`, `memory_facts`); named Docker volume for InsightFace models (002-face-recognition)
+- Python 3.11 + FastAPI + Uvicorn (existing), SQLite via stdlib `sqlite3` (existing), `urllib.request` for HA REST polling (existing) (004-presence-tracking)
+- SQLite `aihub.db` — new `desk_trips` table (004-presence-tracking)
 
 - Python 3.11 + FastAPI 0.115.6, Uvicorn 0.32.1, Pillow 10.4.0, OpenCV-headless 0.10.0.84 (no new dependencies required) (001-humanize-ai-companion)
 
@@ -40,6 +42,7 @@ cd src [ONLY COMMANDS FOR ACTIVE TECHNOLOGIES][ONLY COMMANDS FOR ACTIVE TECHNOLO
 Python 3.11: Follow standard conventions
 
 ## Recent Changes
+- 004-presence-tracking: Added Python 3.11 + FastAPI + Uvicorn (existing), SQLite via stdlib `sqlite3` (existing), `urllib.request` for HA REST polling (existing)
 - 002-face-recognition: Added Python 3.11 + insightface 0.7.3, onnxruntime-gpu, FastAPI (existing), httpx (HA snapshot fetch), numpy
 
 - 001-humanize-ai-companion: Added Python 3.11 + FastAPI 0.115.6, Uvicorn 0.32.1, Pillow 10.4.0, OpenCV-headless 0.10.0.84 (no new dependencies required)

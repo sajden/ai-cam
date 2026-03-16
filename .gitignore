@@ -15,6 +15,13 @@ __pycache__/
 *.pyc
 *.pyo
 
+# go2rtc live configs (contain RTSP credentials)
+go2rtc/config.yaml
+go2rtc/go2rtc.yaml
+
+# temp files
+tmp/
+
 # OS / IDE
 .DS_Store
 Thumbs.db

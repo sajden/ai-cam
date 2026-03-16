@@ -190,7 +190,10 @@ services:
     ports:
       # OAuth callback must be reachable from the browser on the host.
       # Internal Docker traffic still uses the container name (http://aihub:8080).
-      - "127.0.0.1:8080:8080"
+      - "0.0.0.0:8080:8080"
+    command: >
+      sh -c "pip install pychromecast gtfs-realtime-bindings -q &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8080"
     depends_on:
       - codex-gateway
       - camera-voice-bridge
