@@ -188,6 +188,15 @@ def _build_session_context_block(
     except Exception:
         pass
 
+    # Inject live Home Assistant context
+    try:
+        from .ha_context import build_ha_context_block
+        ha_block = build_ha_context_block()
+        if ha_block:
+            lines.append(ha_block)
+    except Exception:
+        pass
+
     return ("\n\n[Session]\n" + "\n".join(lines)) if lines else ""
 
 

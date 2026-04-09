@@ -147,7 +147,10 @@ def fetch_departures() -> dict[str, Any]:
         is_primary = idx == 0
         try:
             url = SL_DEPARTURES_URL.format(site_id=site_id)
-            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            req = urllib.request.Request(url, headers={
+                "Accept": "application/json",
+                "Ocp-Apim-Subscription-Key": TRAFIKLAB_REALTIME_KEY,
+            })
             with urllib.request.urlopen(req, timeout=8) as resp:
                 data = json.loads(resp.read())
             for dep in data.get("departures", []):
@@ -488,6 +491,27 @@ DEPARTURE_BOARD_HTML = r"""<!DOCTYPE html>
     animation: pulse 2s infinite;
   }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+  /* ── Mobile ── */
+  @media (max-width: 768px) {
+    html, body { overflow: auto; height: auto; }
+    .layout { height: auto; min-height: 100vh; }
+    header { padding: 12px 16px 10px; }
+    .header-left h1 { font-size: 1.1rem; }
+    .header-left .subtitle { font-size: 0.78rem; }
+    .clock { font-size: 1.8rem; letter-spacing: 1px; }
+    .content { flex-direction: column; overflow: visible; }
+    .table-pane { flex: none; padding: 12px 0 0 16px; padding-right: 16px; }
+    .map-pane { flex: none; height: 280px; border-left: none; border-top: 1px solid #1e2350; }
+    table { width: 100%; }
+    td { padding: 10px 8px; font-size: 0.95rem; }
+    thead th { padding: 0 8px 8px; }
+    .badge { min-width: 36px; height: 24px; font-size: 0.8rem; }
+    .disruptions { padding: 10px 16px 12px; }
+    footer { padding: 8px 16px 12px; }
+    /* hide stop name column on small screens */
+    thead th:nth-child(2), td:nth-child(2) { display: none; }
+  }
 </style>
 </head>
 <body>
@@ -498,7 +522,8 @@ DEPARTURE_BOARD_HTML = r"""<!DOCTYPE html>
       <h1>Rånövägen &rarr; Brommaplan</h1>
       <div class="subtitle">Nästa avgångar i realtid</div>
     </div>
-    <div>
+    <div style="display:flex;flex-direction:column;align-items:flex-end;gap:6px;">
+      <button id="cast-btn" onclick="castToTV()" style="background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.12);color:#94a3b8;font-size:.75rem;font-weight:600;padding:4px 10px;border-radius:8px;cursor:pointer;font-family:inherit;">Casta</button>
       <div class="clock" id="clock">--:--</div>
       <div class="date" id="date"></div>
     </div>
@@ -751,6 +776,17 @@ updateClock();
 fetchDepartures();
 fetchVehicles();
 fetchDisruptions();
+
+async function castToTV() {
+  const btn = document.getElementById('cast-btn');
+  btn.textContent = '…';
+  try {
+    const r = await fetch('/departures/cast', {method:'POST'});
+    btn.style.color = r.ok ? '#4ade80' : '#f87171';
+    btn.textContent = r.ok ? 'Castad ✓' : 'Fel';
+  } catch { btn.style.color='#f87171'; btn.textContent='Fel'; }
+  setTimeout(() => { btn.style.color=''; btn.textContent='Casta'; }, 4000);
+}
 </script>
 </body>
 </html>

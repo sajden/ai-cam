@@ -23,6 +23,66 @@
 name: ai-cam
 
 services:
+  operator-hub:
+    image: node:22-bookworm
+    container_name: ai-cam-operator-hub
+    restart: unless-stopped
+    working_dir: /workspace/operator-hub/hub
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      TZ: ${TZ:-Europe/Stockholm}
+      OPERATOR_HUB_HOST: 0.0.0.0
+      OPERATOR_HUB_PORT: 8787
+      OPERATOR_HUB_APP_BASE_PATH: /operatorhub-app
+      OPERATOR_HUB_HOST_REPO_ROOT: /home/sajden/github/operator-hub
+      # bgremover HTTP service (runs as a sibling container with GPU access)
+      BGREMOVER_URL: http://bgremover:8095
+      # OneDrive cloud watcher — reads input and writes output directly via Graph API
+      BG_CLOUD_INPUT_PATH: ${BG_CLOUD_INPUT_PATH:-Seb/Videos/raw-videos}
+      BG_CLOUD_OUTPUT_PATH: ${BG_CLOUD_OUTPUT_PATH:-Seb/Videos/no-bg-videos}
+    volumes:
+      - ../operator-hub:/workspace/operator-hub
+      - ${BG_INPUT_HOST_DIR:-./data/bg-input}:/workspace/bg-input
+      - ${BG_OUTPUT_HOST_DIR:-./data/bg-output}:/workspace/bg-output
+    ports:
+      - "127.0.0.1:8787:8787"
+    command: >
+      sh -c "apt-get update -qq &&
+             apt-get install -y -q ffmpeg &&
+             npm run dev"
+    networks:
+      - ai_net
+
+  # bgremover = GPU background removal service.
+  # Exposes a simple HTTP API on port 8095 (internal only).
+  # operator-hub submits jobs here; results land in BG_OUTPUT_HOST_DIR.
+  bgremover:
+    build:
+      context: ../bg-remover
+      dockerfile: Dockerfile.server
+    container_name: ai-cam-bgremover
+    restart: unless-stopped
+    environment:
+      BGR_OUTPUT_DIR: /output
+      BGR_INPUT_DIR: /input
+      BGR_PORT: "8095"
+    volumes:
+      - ${BG_INPUT_HOST_DIR:-./data/bg-input}:/input
+      - ${BG_OUTPUT_HOST_DIR:-./data/bg-output}:/output
+      - ${U2NET_HOME_HOST_DIR:-./data/u2net}:/root/.u2net
+    expose:
+      - "8095"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - ai_net
+
   # Mosquitto = MQTT broker (message bus).
   # MQTT is a lightweight local pub/sub system:
   # - Frigate publishes "I detected a person" events
@@ -136,6 +196,7 @@ services:
       - .env
     environment:
       TZ: ${TZ:-Europe/Stockholm}
+      OPERATOR_HUB_PROXY_BASE_URL: ${OPERATOR_HUB_PROXY_BASE_URL:-http://operator-hub:8787}
       # If empty, token auth is disabled (internal Docker network only).
       AIHUB_TOKEN: ${AIHUB_TOKEN:-}
       AIHUB_DB_PATH: /data/aihub.db
@@ -185,6 +246,15 @@ services:
       # Proactive companion
       AIHUB_PROACTIVE_ENABLED: ${AIHUB_PROACTIVE_ENABLED:-0}
       AIHUB_MORNING_GREETING_TIME: ${AIHUB_MORNING_GREETING_TIME:-07:00}
+      # Home Assistant context (Jarvis awareness)
+      AIHUB_HA_URL: ${AIHUB_HA_URL:-http://homeassistant:8123}
+      AIHUB_HA_TOKEN: ${AIHUB_HA_TOKEN:-}
+      AIHUB_HA_CONTEXT_CACHE_SEC: ${AIHUB_HA_CONTEXT_CACHE_SEC:-30}
+      # Keyboard/mouse activity tracker — 1 = drives desk trips instead of camera
+      AIHUB_KB_TRACKER_ENABLED: ${AIHUB_KB_TRACKER_ENABLED:-0}
+      # Windy APIs
+      WINDY_WEBCAMS_API_KEY: ${WINDY_WEBCAMS_API_KEY:-}
+      WINDY_MAP_API_KEY: ${WINDY_MAP_API_KEY:-}
     volumes:
       - ./data/aihub:/data
     ports:
@@ -195,6 +265,7 @@ services:
       sh -c "pip install pychromecast gtfs-realtime-bindings -q &&
              uvicorn app.main:app --host 0.0.0.0 --port 8080"
     depends_on:
+      - operator-hub
       - codex-gateway
       - camera-voice-bridge
       - face-recognition

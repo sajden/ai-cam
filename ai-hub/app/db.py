@@ -235,8 +235,22 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_desk_trips_date ON desk_trips(date);
+
+            CREATE TABLE IF NOT EXISTS input_stats (
+                date             TEXT PRIMARY KEY,
+                keypresses       INTEGER NOT NULL DEFAULT 0,
+                clicks           INTEGER NOT NULL DEFAULT 0,
+                first_active_at  TEXT,
+                updated_at       TEXT    NOT NULL
+            );
             """
         )
+    # Migrate existing DBs: add first_active_at if missing
+    try:
+        with connect() as _c:
+            _c.execute("ALTER TABLE input_stats ADD COLUMN first_active_at TEXT")
+    except Exception:
+        pass  # column already exists
     _seed_defaults()
 
 

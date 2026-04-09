@@ -167,6 +167,28 @@ def get_ha_state(cfg: HAConfig, entity_id: str) -> tuple[str | None, str]:
         return None, f"error:{type(exc).__name__}"
 
 
+def get_ha_last_changed(cfg: HAConfig, entity_id: str) -> float | None:
+    """Return seconds since last state change for entity_id, or None on error."""
+    if not cfg.token:
+        return None
+    url = f"{cfg.base_url}/api/states/{entity_id}"
+    req = urllib.request.Request(
+        url,
+        headers={"Authorization": f"Bearer {cfg.token}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            lc = data.get("last_changed")
+            if not lc:
+                return None
+            from datetime import datetime, timezone
+            dt = datetime.fromisoformat(lc.replace("Z", "+00:00"))
+            return (datetime.now(timezone.utc) - dt).total_seconds()
+    except Exception:
+        return None
+
+
 def control_air_purifier(cfg: HAConfig, command: str) -> tuple[bool, str]:
     """Control Philips air purifier fan. command: on|off|auto|sleep|turbo|speed_1|speed_2|speed_3"""
     entity = os.getenv("AIHUB_AIR_PURIFIER_ENTITY", "fan.sovrum")

@@ -21,7 +21,7 @@ try:
 except Exception:  # pragma: no cover
     Image = None
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -257,10 +257,14 @@ PROACTIVE_ENABLED = os.getenv("AIHUB_PROACTIVE_ENABLED", "0").strip() == "1"
 MORNING_GREETING_TIME = os.getenv("AIHUB_MORNING_GREETING_TIME", "07:00").strip()
 PRESENCE_ENABLED = os.getenv("AIHUB_PRESENCE_ENABLED", "1").strip() == "1"
 PRESENCE_ENTITY = os.getenv("AIHUB_PRESENCE_ENTITY", "binary_sensor.reolink_e1pro_person").strip()
+PRESENCE_MOTION_ENTITY = os.getenv("AIHUB_PRESENCE_MOTION_ENTITY", "binary_sensor.living_room_rorelse").strip()
+PRESENCE_MOTION_WINDOW_SEC = int(os.getenv("AIHUB_PRESENCE_MOTION_WINDOW_SEC", "30"))
 PRESENCE_POLL_SEC = float(os.getenv("AIHUB_PRESENCE_POLL_SEC", "5"))
 PRESENCE_MIN_TRIP_SEC = int(os.getenv("AIHUB_PRESENCE_MIN_TRIP_SEC", "60"))
 PRESENCE_MAX_TRIP_SEC = int(os.getenv("AIHUB_PRESENCE_MAX_TRIP_SEC", "14400"))
 PRESENCE_SITTING_ALERT_SEC = int(os.getenv("AIHUB_PRESENCE_SITTING_ALERT_SEC", "7200"))
+# Keyboard/mouse activity tracker — drives desk trips instead of camera when active
+KB_TRACKER_ENABLED = os.getenv("AIHUB_KB_TRACKER_ENABLED", "0").strip() == "1"
 
 # Enrollment intent pattern (voice: "Det här är Sebastian")
 _ENROLL_INTENT = re.compile(
@@ -404,6 +408,14 @@ def _detect_air_intent(text: str) -> dict | None:
 
 app = FastAPI(title="ai-hub", version=APP_VERSION)
 
+from .weather_router import router as weather_router  # noqa: E402
+app.include_router(weather_router)
+from .desk_router import router as desk_router  # noqa: E402
+app.include_router(desk_router)
+from .castboard_router import router as castboard_router  # noqa: E402
+app.include_router(castboard_router)
+from .operatorhub_router import router as operatorhub_router  # noqa: E402
+app.include_router(operatorhub_router)
 
 _vision_loop_started = False
 # Cooldown to prevent echo loops after Ollama-classified vision queries.
@@ -1364,14 +1376,16 @@ class PresenceTracker:
     """Polls the HA Reolink person sensor and records away-trips to desk_trips."""
 
     def __init__(self) -> None:
-        from .actions import load_ha_config, get_ha_state as _get_ha_state
+        from .actions import load_ha_config, get_ha_state as _get_ha_state, get_ha_last_changed as _get_ha_last_changed
         self._load_ha_config = load_ha_config
         self._get_ha_state = _get_ha_state
+        self._get_ha_last_changed = _get_ha_last_changed
         self._person_present: bool = True
         self._away_since: float | None = None
         self._open_trip_id: int | None = None
         self._at_desk_since: float = time.monotonic()
         self._last_sitting_comment_at: float = 0.0
+        self._last_motion_at: float = 0.0  # monotonic timestamp of last motion event
         self._stop_event = threading.Event()
 
     def start(self) -> None:
@@ -1424,10 +1438,18 @@ class PresenceTracker:
                     today = datetime.now(timezone.utc).astimezone().date().isoformat()
 
                     if self._person_present and not present:
-                        # Person just left
-                        self._away_since = now_mono
-                        tod = self._time_of_day()
-                        self._open_trip_id = db.log_desk_trip_start(now_utc, today, tod)
+                        # Only start a trip if motion sensor fired recently (real departure)
+                        allow_trip = True
+                        if PRESENCE_MOTION_ENTITY:
+                            motion_age = self._get_ha_last_changed(cfg, PRESENCE_MOTION_ENTITY)
+                            if motion_age is not None and motion_age > PRESENCE_MOTION_WINDOW_SEC:
+                                allow_trip = False
+                                log.debug("Presence: person gone but motion was %.0fs ago — ignoring", motion_age)
+                        if allow_trip:
+                            # Person just left
+                            self._away_since = now_mono
+                            tod = self._time_of_day()
+                            self._open_trip_id = db.log_desk_trip_start(now_utc, today, tod)
                         self._person_present = False
 
                     elif not self._person_present and present:
@@ -1999,9 +2021,129 @@ def startup() -> None:
     warmup_ollama()
     global _presence_tracker
     db.close_open_trips(datetime.now(timezone.utc).isoformat())
-    if PRESENCE_ENABLED:
+    if PRESENCE_ENABLED and not KB_TRACKER_ENABLED:
         _presence_tracker = PresenceTracker()
         _presence_tracker.start()
+
+
+# ---------------------------------------------------------------------------
+# Keyboard/mouse activity tracker state
+# ---------------------------------------------------------------------------
+
+_kb_lock = threading.Lock()
+_kb_active: bool = False         # assume away at startup — no trip until first real activity
+_kb_idle_sec: int = 0
+_kb_last_report: float = 0.0
+_kb_trip_id: int | None = None
+_kb_away_since: float | None = None
+
+
+def _kb_time_of_day() -> str:
+    hour = datetime.now().hour
+    if 6 <= hour < 12:
+        return "morning"
+    if 12 <= hour < 18:
+        return "afternoon"
+    return "evening"
+
+
+@app.post("/v1/presence/activity")
+async def presence_activity(request: Request) -> dict[str, Any]:
+    """Keyboard/mouse activity report from Windows tracker.
+
+    Body: {"active": bool, "device": str, "idle_sec": int}
+    When KB_TRACKER_ENABLED, drives desk_trips just like PresenceTracker.
+    Always accepted (so the endpoint exists), only acts when KB_TRACKER_ENABLED.
+    """
+    global _kb_active, _kb_idle_sec, _kb_last_report, _kb_trip_id, _kb_away_since
+
+    body = await request.json()
+    active = bool(body.get("active", True))
+    idle_sec = int(body.get("idle_sec", 0))
+    keypresses = int(body.get("keypresses", 0))
+    clicks = int(body.get("clicks", 0))
+
+    # Accumulate input stats into DB
+    if keypresses > 0 or clicks > 0:
+        today = datetime.now(timezone.utc).astimezone().date().isoformat()
+        now_utc = datetime.now(timezone.utc).isoformat()
+        try:
+            with db.connect() as _c:
+                _c.execute(
+                    "INSERT INTO input_stats (date, keypresses, clicks, first_active_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(date) DO UPDATE SET "
+                    "keypresses = keypresses + excluded.keypresses, "
+                    "clicks = clicks + excluded.clicks, "
+                    "updated_at = excluded.updated_at",
+                    # first_active_at intentionally excluded from UPDATE — keeps first value
+                    (today, keypresses, clicks, now_utc, now_utc),
+                )
+        except Exception as exc:
+            log.warning("input_stats write failed: %s", exc)
+
+    with _kb_lock:
+        was_active = _kb_active
+        _kb_active = active
+        _kb_idle_sec = idle_sec
+        _kb_last_report = time.monotonic()
+
+        if KB_TRACKER_ENABLED:
+            now_utc = datetime.now(timezone.utc).isoformat()
+            today = datetime.now(timezone.utc).astimezone().date().isoformat()
+
+            if was_active and not active:
+                # Active → away: start trip
+                _kb_trip_id = db.log_desk_trip_start(now_utc, today, _kb_time_of_day())
+                _kb_away_since = time.monotonic()
+                log.info("KB tracker: rast börjar (idle %ds)", idle_sec)
+
+            elif not was_active and active:
+                # Away → active: end trip
+                if _kb_trip_id is not None and _kb_away_since is not None:
+                    duration = int(time.monotonic() - _kb_away_since)
+                    if duration >= PRESENCE_MIN_TRIP_SEC:
+                        db.log_desk_trip_end(_kb_trip_id, now_utc, duration)
+                        log.info("KB tracker: tillbaka efter %ds rast", duration)
+                    else:
+                        try:
+                            with db.connect() as _c:
+                                _c.execute("DELETE FROM desk_trips WHERE id = ?", (_kb_trip_id,))
+                        except Exception:
+                            pass
+                        log.debug("KB tracker: rast %ds — för kort, ignoreras", duration)
+                _kb_trip_id = None
+                _kb_away_since = None
+
+    return {"ok": True, "kb_tracker_enabled": KB_TRACKER_ENABLED}
+
+
+@app.get("/v1/jarvis/status")
+def jarvis_status() -> dict[str, Any]:
+    """Public endpoint — returns Jarvis status for HA sensor. No auth required."""
+    mode = _parse_mode()
+    privacy = mode.get("privacy_mode", False)
+    conv_id = mode.get("conversation_id", "")
+    expires_at = mode.get("conversation_expires_at", "")
+
+    if privacy:
+        status = "sekretess"
+    elif conv_id and expires_at:
+        try:
+            from datetime import datetime, timezone
+            exp = datetime.fromisoformat(expires_at)
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) < exp:
+                status = "aktiv"
+            else:
+                status = "inaktiv"
+        except Exception:
+            status = "inaktiv"
+    else:
+        status = "inaktiv"
+
+    return {"status": status, "privacy_mode": privacy, "conversation_active": bool(conv_id)}
 
 
 @app.get("/v1/health", dependencies=[Depends(_require_auth)])

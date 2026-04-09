@@ -50,6 +50,12 @@ if ([string]::IsNullOrWhiteSpace($token)) {
 $env:AUDIO_BRIDGE_TOKEN = $token
 $env:AUDIO_BRIDGE_ALLOWED_CALLERS = $AllowedCallers
 
+# Optional: partial name of the Bluetooth speaker for keepalive targeting.
+$btSpeakerName = Get-DotEnvValue -Path $RepoEnvPath -Key "AUDIO_BRIDGE_BT_SPEAKER_NAME"
+if (-not [string]::IsNullOrWhiteSpace($btSpeakerName)) {
+    $env:BT_SPEAKER_NAME = $btSpeakerName
+}
+
 Write-Host "[audio-bridge] Using env file: $RepoEnvPath"
 Write-Host "[audio-bridge] Allowed callers: $AllowedCallers"
 Write-Host "[audio-bridge] Token loaded: yes"
