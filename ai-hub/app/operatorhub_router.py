@@ -140,7 +140,7 @@ async def articles_proxy(request: Request) -> Response:
 
 @router.api_route(
     "/api/articles/{full_path:path}",
-    methods=["GET", "POST", "OPTIONS"],
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
 )
 async def articles_path_proxy(full_path: str, request: Request) -> Response:
     return await _proxy_api_request(request, f"articles/{full_path}")
