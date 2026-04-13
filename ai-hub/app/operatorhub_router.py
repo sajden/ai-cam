@@ -123,6 +123,14 @@ async def _proxy_api_request(request: Request, api_path: str) -> Response:
 
 
 @router.api_route(
+    "/api/jobs",
+    methods=["GET", "OPTIONS"],
+)
+async def jobs_proxy(request: Request) -> Response:
+    return await _proxy_api_request(request, "jobs")
+
+
+@router.api_route(
     "/api/articles",
     methods=["GET", "POST", "OPTIONS"],
 )
