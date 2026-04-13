@@ -44,8 +44,13 @@ services:
       # SEO article generator — calls codex-gateway for article drafts
       SEO_CODEX_URL: http://codex-gateway:8090/v1/ask
       SEO_CODEX_TIMEOUT_SEC: ${SEO_CODEX_TIMEOUT_SEC:-120}
+      # SEO publisher — writes MDX to sebcastwall repo and triggers revalidation
+      SEO_PUBLISH_REPO: ${SEO_PUBLISH_REPO:-/home/sajden/github/sebcastwall}
+      SEO_REVALIDATE_URL: ${SEO_REVALIDATE_URL:-}
+      SEO_REVALIDATE_SECRET: ${SEO_REVALIDATE_SECRET:-}
     volumes:
       - ../operator-hub:/workspace/operator-hub
+      - ../sebcastwall:/home/sajden/github/sebcastwall
       - ${BG_INPUT_HOST_DIR:-./data/bg-input}:/workspace/bg-input
       - ${BG_OUTPUT_HOST_DIR:-./data/bg-output}:/workspace/bg-output
     ports:
