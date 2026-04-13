@@ -44,7 +44,6 @@ services:
       # SEO article generator — calls codex-gateway for article drafts
       SEO_CODEX_URL: http://codex-gateway:8090/v1/ask
       SEO_CODEX_TIMEOUT_SEC: ${SEO_CODEX_TIMEOUT_SEC:-120}
-      SERPAPI_KEY: ${SERPAPI_KEY:-}
     volumes:
       - ../operator-hub:/workspace/operator-hub
       - ${BG_INPUT_HOST_DIR:-./data/bg-input}:/workspace/bg-input
