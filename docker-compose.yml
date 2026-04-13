@@ -46,7 +46,7 @@ services:
       SEO_CODEX_TIMEOUT_SEC: ${SEO_CODEX_TIMEOUT_SEC:-120}
       # SEO publisher — writes MDX to sebcastwall repo and triggers revalidation
       SEO_PUBLISH_REPO: ${SEO_PUBLISH_REPO:-/home/sajden/github/sebcastwall}
-      SEO_REVALIDATE_URL: ${SEO_REVALIDATE_URL:-}
+      SEO_REVALIDATE_URL: ${SEO_REVALIDATE_URL:-https://sebcastwall.se/api/revalidate}
       SEO_REVALIDATE_SECRET: ${SEO_REVALIDATE_SECRET:-}
     volumes:
       - ../operator-hub:/workspace/operator-hub
