@@ -269,6 +269,8 @@ services:
       WINDY_MAP_API_KEY: ${WINDY_MAP_API_KEY:-}
     volumes:
       - ./data/aihub:/data
+      # Mount source so router/code changes take effect on restart, no rebuild needed
+      - ./ai-hub/app:/app/app
     ports:
       # OAuth callback must be reachable from the browser on the host.
       # Internal Docker traffic still uses the container name (http://aihub:8080).
