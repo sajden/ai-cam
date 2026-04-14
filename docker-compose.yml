@@ -48,6 +48,10 @@ services:
       SEO_PUBLISH_REPO: ${SEO_PUBLISH_REPO:-/home/sajden/github/sebcastwall}
       SEO_REVALIDATE_URL: ${SEO_REVALIDATE_URL:-https://sebcastwall.se/api/revalidate}
       SEO_REVALIDATE_SECRET: ${SEO_REVALIDATE_SECRET:-}
+      # Sebcastwall advisor admin
+      SEBCASTWALL_ADVISOR_ADMIN_SECRET: ${SEBCASTWALL_ADVISOR_ADMIN_SECRET:-}
+      SEBCASTWALL_ADVISOR_CHATS_URL: ${SEBCASTWALL_ADVISOR_CHATS_URL:-https://sebcastwall.se/api/advisor/chats}
+      SEBCASTWALL_ADVISOR_ABUSE_URL: ${SEBCASTWALL_ADVISOR_ABUSE_URL:-https://sebcastwall.se/api/advisor/abuse}
     volumes:
       - ../operator-hub:/workspace/operator-hub
       - ../sebcastwall:/home/sajden/github/sebcastwall

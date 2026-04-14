@@ -131,6 +131,22 @@ async def jobs_proxy(request: Request) -> Response:
 
 
 @router.api_route(
+    "/api/advisor-abuse",
+    methods=["GET", "OPTIONS"],
+)
+async def advisor_abuse_proxy(request: Request) -> Response:
+    return await _proxy_api_request(request, "advisor-abuse")
+
+
+@router.api_route(
+    "/api/advisor-chats",
+    methods=["GET", "OPTIONS"],
+)
+async def advisor_chats_proxy(request: Request) -> Response:
+    return await _proxy_api_request(request, "advisor-chats")
+
+
+@router.api_route(
     "/api/articles",
     methods=["GET", "POST", "OPTIONS"],
 )
