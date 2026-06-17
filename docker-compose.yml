@@ -39,32 +39,45 @@ services:
       # bgremover HTTP service (runs as a sibling container with GPU access)
       BGREMOVER_URL: http://bgremover:8095
       # OneDrive cloud watcher — reads input and writes output directly via Graph API
-      BG_CLOUD_INPUT_PATH: ${BG_CLOUD_INPUT_PATH:-Seb/Videos/raw-videos}
-      BG_CLOUD_OUTPUT_PATH: ${BG_CLOUD_OUTPUT_PATH:-Seb/Videos/no-bg-videos}
-      # SEO article generator — calls codex-gateway for article drafts
-      SEO_CODEX_URL: http://codex-gateway:8090/v1/ask
-      SEO_CODEX_TIMEOUT_SEC: ${SEO_CODEX_TIMEOUT_SEC:-120}
-      # SEO publisher — writes MDX to sebcastwall repo and triggers revalidation
-      SEO_PUBLISH_REPO: ${SEO_PUBLISH_REPO:-/home/sajden/github/sebcastwall}
-      SEO_REVALIDATE_URL: ${SEO_REVALIDATE_URL:-https://sebcastwall.se/api/revalidate}
-      SEO_REVALIDATE_SECRET: ${SEO_REVALIDATE_SECRET:-}
+      BG_CLOUD_RAW_BASE: ${BG_CLOUD_RAW_BASE:-Seb/Videos/raw-videos}
+      BG_CLOUD_NOBG_BASE: ${BG_CLOUD_NOBG_BASE:-Seb/Videos/no-bg-videos}
+      BG_CLOUD_SLOT_COUNT: ${BG_CLOUD_SLOT_COUNT:-10}
+      LOCAL_NOBG_BASE: ${LOCAL_NOBG_BASE:-/mnt/onedrive-nobg}
+      LOCAL_RAW_BASE: ${LOCAL_RAW_BASE:-/mnt/onedrive-raw}
+      # Microsoft Graph client credentials (app-only auth — no refresh token expiry)
+      OPERATOR_HUB_MS_TENANT_ID: ${OPERATOR_HUB_MS_TENANT_ID:-}
+      OPERATOR_HUB_MS_CLIENT_ID: ${OPERATOR_HUB_MS_CLIENT_ID:-}
+      OPERATOR_HUB_MS_CLIENT_SECRET: ${OPERATOR_HUB_MS_CLIENT_SECRET:-}
+      OPERATOR_HUB_MS_USE_CLIENT_CREDENTIALS: ${OPERATOR_HUB_MS_USE_CLIENT_CREDENTIALS:-false}
+      OPERATOR_HUB_MS_DRIVE_USER: ${OPERATOR_HUB_MS_DRIVE_USER:-}
+      OPERATOR_HUB_MS_SCOPES: ${OPERATOR_HUB_MS_SCOPES:-openid profile offline_access User.Read Files.ReadWrite.All Sites.ReadWrite.All}
+      # SEO hub external service (same pattern as seo-checker)
+      SEO_HUB_URL: ${SEO_HUB_URL:-http://host.docker.internal:3001}
       # Sebcastwall advisor admin
       SEBCASTWALL_ADVISOR_ADMIN_SECRET: ${SEBCASTWALL_ADVISOR_ADMIN_SECRET:-}
       SEBCASTWALL_ADVISOR_CHATS_URL: ${SEBCASTWALL_ADVISOR_CHATS_URL:-https://sebcastwall.se/api/advisor/chats}
       SEBCASTWALL_ADVISOR_ABUSE_URL: ${SEBCASTWALL_ADVISOR_ABUSE_URL:-https://sebcastwall.se/api/advisor/abuse}
+      OPERATOR_HUB_REMOTION_BROWSER_EXECUTABLE: /usr/bin/chromium
+      OPERATOR_HUB_SHORT_FORM_ARTICLE_SCREENSHOT_BROWSER: /usr/bin/chromium
+      VIDEO_PIPELINE_URL: ${VIDEO_PIPELINE_URL:-http://host.docker.internal:3421}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ../operator-hub:/workspace/operator-hub
       - ../sebcastwall:/home/sajden/github/sebcastwall
       - ${BG_INPUT_HOST_DIR:-./data/bg-input}:/workspace/bg-input
       - ${BG_OUTPUT_HOST_DIR:-./data/bg-output}:/workspace/bg-output
+      - ${LOCAL_NOBG_HOST_DIR:-/mnt/c/Users/sebas/OneDrive - Settler Technology AB/Seb/Videos/no-bg-videos}:/mnt/onedrive-nobg:ro
+      - ${LOCAL_RAW_HOST_DIR:-/mnt/c/Users/sebas/OneDrive - Settler Technology AB/Seb/Videos/raw-videos}:/mnt/onedrive-raw:ro
     ports:
       - "127.0.0.1:8787:8787"
     command: >
       sh -c "apt-get update -qq &&
-             apt-get install -y -q ffmpeg &&
+             apt-get install -y -q ffmpeg chromium python3-pip &&
+             pip3 install --break-system-packages playwright openai-whisper &&
              npm run dev"
     networks:
       - ai_net
+      - services-net
 
   # bgremover = GPU background removal service.
   # Exposes a simple HTTP API on port 8095 (internal only).
@@ -535,6 +548,8 @@ networks:
   ai_net:
     name: ai-cam-net
     driver: bridge
+  services-net:
+    external: true
 
 volumes:
   # Codex CLI auth persisted in Docker-managed volume to avoid WSL2 bind-mount issues.
